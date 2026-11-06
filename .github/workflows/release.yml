@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pillow amitools
+
+      - name: Build bootable ADF and HDF
+        run: |
+          make adf
+          make hdf
+
+      - name: Verify images
+        run: |
+          ls -lh build/parallax-demo.adf build/parallax-demo.hdf
+          python3 -m amitools.tools.xdftool build/parallax-demo.adf boot show
+          python3 -m amitools.tools.rdbtool build/parallax-demo.hdf list
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: parallax-amiga
+          if-no-files-found: error
+          path: |
+            build/parallax-demo.adf
+            build/parallax-demo.hdf
+            build/parallax
+            build/parallax.dat
+            docs/screenshot.png
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Parallax demo ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            build/parallax-demo.adf
+            build/parallax-demo.hdf
+            build/parallax
+            build/parallax.dat
+            docs/screenshot.png
