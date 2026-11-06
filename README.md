@@ -1,7 +1,9 @@
 # Parallax Scrolling Demo — Amiga 1200 (AGA)
 
-A three-layer parallax demo for AGA Amigas, drawn **entirely with the blitter**,
-using the war-torn background art from
+A parallax scrolling demo for AGA Amigas running **locked at 50 fps**:
+hardware-scrolled dual playfield, a copper sky, a sprite sun and the blitter
+streaming new columns into the scrolling buffers. It uses the war-torn
+background art from
 `craftpix-771800-free-war-pixel-art-2d-game-backgrounds.zip`
 (the **War1 / Bright** layer set: sky, sun, ruins, houses, road, fence, craters).
 
@@ -9,25 +11,20 @@ using the war-torn background art from
 
 ## What you see
 
-* **352×256 AGA PAL screen, 5 bitplanes (32 colours)** with a 320×200 visible
-  window at (16, 28); the remaining area is a black border used for the title
-  (`PARALLAX // BLITTER SCROLLING`) and caption (`AMIGA 1200 AGA 32 COLOURS`).
-* A static **sky + sun** background.
-* A **midground** of ruins/buildings, scrolled with the blitter at
-  **0.375 px per 50 Hz tick** (≈18.75 px/s), rendered as an *opaque* band (the
-  sky above the silhouette is prefilled with the row's sky colour, holes are
-  black).
-* A **foreground** of houses/road/fence/craters, scrolled at **1 px per tick**
-  (≈50 px/s), rendered with a **cookie-cut masked blit** so the midground
-  shows through.
-* **Time-based scrolling**: offsets advance by the elapsed 50 Hz ticks
-  (`DateStamp`), so the speed stays constant even when a frame takes longer.
-* Double buffering with `graphics.library/ChangeVPBitMap()` (V39+); the loop
-  flips on the vertical blank and drains the DBufInfo notifications.
+* **320×228 PAL display**: a 28-line title band and the 320×200 scene.
+* **Sky** — one colour per scanline, written to `COLOR00` by the copper.
+* **Sun** — three 16-pixel hardware sprites placed *behind* both playfields,
+  so its glow disappears behind the ruins.
+* **Midground** (ruins + house3 + houses2) — playfield 2, 4 bitplanes,
+  15 colours, scrolling at **0.5 px/frame** (25 px/s).
+* **Foreground** (houses1 + fence + road + craters) — playfield 1, 4
+  bitplanes, 15 colours, scrolling at **1 px/frame** (50 px/s).
+* Scroll steps are AGA **quarter pixels**, and the loop is locked to the
+  vertical blank: every frame moves exactly the same distance.
 
 ## Controls
 
-* **ESC** or **CTRL-C** — quit and return to Workbench.
+* **ESC**, the **left mouse button** or **CTRL-C** — quit and return to the OS.
 
 ## Build
 
@@ -65,17 +62,18 @@ The PNG layers were extracted from the supplied zip into `assets/`.
 [`tools/build_assets.py`](tools/build_assets.py) performs the conversion:
 
 1. Loads `assets/PNG/War1/Bright/*.png` and scales the layers to 320×200.
-2. Builds a **32-colour, 12-bit (Amiga 0xRGB)** palette from the full composite
-   and remaps the layers with Floyd–Steinberg dithering.
-3. Splits the scene into an **opaque midground** (ruins + house3 + houses2,
-   with sky/black prefill) and a **masked foreground** (houses1 + fence + road +
-   craters, split into a masked top and an opaque bottom).
-4. **Mirror-tiles** each layer (`[scene][mirror(scene)]`, period 640 px) and
-   appends a 352-px run-out, so horizontal wrapping is seamless.
-5. Packs everything into 5 planar planes plus a 1-bit mask plane and writes:
-   * `parallax.dat` — background planes + layer strips + masks (215,200 bytes)
-   * `palette.bin` — the palette as 32 × 0x0RGB words (reference export)
-   * `src/assets.h` — generated offsets, sizes and the palette array
+2. Builds a separate **15-colour, 12-bit palette** for each playfield
+   (median cut + k-means on the opaque pixels) and remaps each layer with
+   Floyd–Steinberg dithering; transparent pixels are colour 0.
+3. Turns the sky into one 12-bit colour per scanline and the sun into three
+   3-colour sprites.
+4. **Mirror-tiles** each layer (`[scene][mirror(scene)]`, period 640 px =
+   40 words); row 0 of each strip is left empty on purpose (see below).
+5. Writes:
+   * `parallax.dat` — PF2 and PF1 planar strips and sun sprite data (80 KB)
+   * `palette.bin` — PF1, PF2 and sprite palettes (reference export)
+   * `src/assets.h` — layout constants, palettes and the sky gradient
+   * `preview/*.png` — what the hardware should display
 
 Regenerate with:
 
@@ -129,55 +127,58 @@ parallax/parallax >NIL:
 The demo starts automatically; ESC or CTRL-C returns to the OS. The images
 were boot-tested with Amiberry using a Kickstart 3.1 A1200 ROM.
 
-## Blitter implementation notes
+## How the scrolling works
 
-* **Screen layout.** The screen is 352 px wide so a 16-px side border is
-  available for a one-word *run-up* on each side. The visible 320-px window
-  starts at x = 16.
-* **1-pixel scrolling.** Each layer strip is addressed a word at a time. For a
-  scroll offset `p`, the source pointer is `p >> 4` words and the blitter's
-  **A-channel barrel shifter** (`BLTCON0/ASH = p & 15`) aligns the pixels.
-  Because the blitter shifts in the previous word, one extra word is blitted
-  at x = 0..15 (hidden in the border); the visible window at x = 16 then starts
-  exactly at source pixel `p`. For `ASH = 0` the source pointer is moved one
-  word back so the run-up word is still present.
-* **Planes.** The blitter has one destination channel, so each layer band is
-  copied one plane at a time (5 blits), with `BLTxMOD` set to
-  `strip_stride - 352/8`. All source/mask data lives in chip RAM.
-* **Opaque bands** use minterm `0xF0` (A→D, 2 cycles/word) with only A and D
-  enabled.
-* **Masked foreground** uses the cookie-cut minterm `0xE2`
-  (`D = (A & B) | (C & ~B)`) with A = source plane, B = mask plane and
-  C = D = screen (4 cycles/word).
-* **Mid-layer skip.** The midground's integer offset only changes every few
-  frames, so it is redrawn only when the offset for the target buffer changed;
-  the foreground is redrawn every frame.
-* **Double buffering.** Two displayable bitmaps are swapped with
-  `ChangeVPBitMap()` at the vertical blank. The back buffer is the previous
-  front, so it is already safe to write; DBufInfo notifications are drained
-  rather than waited on, avoiding frame-pacing stalls.
-* **Time-based motion.** The blitter still moves whole pixels, but the scroll
-  offset is advanced from the 50 Hz `DateStamp` tick counter. On a slow frame
-  the layers move 2–3 px instead of 1 px, keeping pixels/second constant.
-* **Blitter priority** (`DMACON/BLTPRI`) is enabled, and the demo runs at
-  task priority −10 so the serial/TCP development bridge stays responsive
-  while the demo is composing frames.
+* **Why not redraw with the blitter?** Redrawing two full-width layers every
+  frame needs ~64,000 blitter cycles, more than the chip bus can give in one
+  PAL frame with the display on: that design tops out around 25 fps, so it
+  stutters. The demo now uses the technique of real Amiga games.
+* **Dual playfield.** `BPLCON0 = $0611`: 8 bitplanes, dual playfield. PF1
+  (odd planes) is the foreground and PF2 (even planes, colours 16–31 via
+  `BPLCON3/PF2OF`) the midground. Each playfield has its own bitplane
+  pointers and its own delay in `BPLCON1`, so the two layers scroll
+  independently at zero CPU/blitter cost.
+* **Quarter-pixel fine scroll.** `DDFSTRT = $30` fetches one extra word and
+  `BPLCON1` delays each playfield by 0–63 quarter pixels (AGA adds two
+  35 ns bits per playfield), while the bitplane pointer advances one word every
+  16 pixels.
+* **Sliding buffer + blitter column streaming.** Each playfield buffer has
+  21 words per row and no modulo. When the start pointer advances by one
+  word, the word that just left the screen on row *y+1* becomes the new
+  right-hand word of row *y*. The blitter (A→D, 1 word × all rows × 4 planes)
+  copies the next 16-pixel column from the mirror-tiled strip into exactly
+  that word, at a moment when it is not visible. That is at most one tiny
+  blit per layer per frame. The buffer has 32 KB of headroom per plane;
+  when it runs out (after ~1.5 h) the position jumps back by whole periods
+  and the window is rebuilt at the start of the buffer.
+* **Copper.** The copper list sets the AGA registers, both palettes, the
+  sprite pointers and one `COLOR00` per scanline (border blanking hides the
+  colour changes outside the window). Playfields above their layer read the
+  strip's empty first row with modulo −42; at the layer's first line the
+  copper switches the modulo to 0 and the playfield starts walking its
+  buffer. Two copper lists are double-buffered: the CPU patches the idle
+  one (pointers + `BPLCON1`) and swaps `COP1LC` once per frame.
+* **System friendly.** The OS keeps running: the demo opens a quiet screen
+  for input, uses `LoadView(NULL)` + its own copper list, owns the blitter
+  only for the column blits, and restores the system view on exit.
 
 ## Performance
 
-On the emulated A1200 (68020, 2 MB chip) the demo runs at roughly
-**25–26 fps** at 320×200 with 32 colours. The blitter work is dominated by the
-opaque midground band (173 rows) and the masked foreground band (45 rows).
-Because the scrolling is time-based, the motion speed is constant even when a
-frame occasionally takes an extra vertical blank.
-The two layers move at different rates, so the parallax is visible even at
-this frame rate.
+Measured on the emulated A1200 with `parallax stats` (frames shown vs.
+50 Hz `DateStamp` ticks): **1329 frames in 1331 ticks**, i.e. a locked
+**50 fps**. A capture of the emulator display matched the expected rendering
+pixel for pixel, before and after a buffer rebase (`parallax rebase` starts
+next to the end of the buffer to test it).
+
+For perfectly smooth motion in an emulator, run it at 50 Hz with VSync (or
+WinUAE/FS-UAE's "low latency vsync" mode); a 60 Hz host display without
+VSync adds judder of its own.
 
 ## Limitations / notes
 
 * The source art is a single 1920×1080 scene; the layers are **mirror-tiled**
   (period 640 px, i.e. two screen widths) to obtain seamless horizontal
   wrapping.
-* 32 colours with dithering; the original art has thousands of colours.
-* Target is AGA (A1200). The code uses `AllocBitMap`/`ChangeVPBitMap`/V39
-  graphics, `DMACON/BLTPRI` and a 352×256×5 screen.
+* 15 colours per playfield with dithering; the original art has thousands
+  of colours.
+* Requires AGA (the demo checks for Lisa and exits on OCS/ECS).

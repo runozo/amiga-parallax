@@ -1,36 +1,38 @@
 /*
  * Parallax scrolling demo for the Amiga 1200 (AGA)
  *
- * Three parallax layers built from craftpix "War1" background art:
- *   - static sky + sun
- *   - midground ruins/buildings  (opaque, scrolled with the blitter)
- *   - foreground houses/road     (masked, scrolled with the blitter)
+ *   sky        per-line COLOR00 gradient written by the copper
+ *   sun        three hardware sprites, behind both playfields
+ *   PF2        midground ruins, 4 bitplanes, 0.5 px/frame
+ *   PF1        foreground houses/road, 4 bitplanes, 1 px/frame
  *
- * The blitter performs every pixel copy.  Horizontal scrolling is done
- * with the blitter's barrel shifter (BLTCON0/ASH): a one-word run-up is
- * written into the 16-pixel screen border so every visible word is exact.
- * Double buffering uses graphics.library ChangeVPBitMap() (V39+).
+ * Scrolling is done by the hardware: AGA dual playfield with independent
+ * bitplane pointers and BPLCON1 delays (quarter-pixel steps) per playfield.
+ * Each playfield buffer is a "sliding" bitmap: rows are packed with no
+ * modulo, so when the display start pointer advances by one word the word
+ * that left the screen on row y+1 becomes the new right-hand column of
+ * row y.  The blitter streams every new 16-pixel column from the
+ * mirror-tiled layer strip into that word.  Per frame the CPU only patches
+ * a few copper words, so the demo is locked to the 50 Hz vertical blank.
  */
 
 #include <exec/types.h>
 #include <exec/memory.h>
 #include <dos/dos.h>
 #include <dos/dosextens.h>
-#include <dos/dostags.h>
 #include <intuition/intuition.h>
 #include <intuition/screens.h>
 #include <graphics/gfx.h>
 #include <graphics/gfxbase.h>
 #include <graphics/view.h>
 #include <graphics/rastport.h>
+#include <graphics/text.h>
+#include <hardware/custom.h>
 #include <proto/exec.h>
 #include <proto/dos.h>
 #include <proto/intuition.h>
 #include <proto/graphics.h>
-#include <hardware/custom.h>
-#include <hardware/blit.h>
 
-#include <stdio.h>
 #include <string.h>
 
 #include "assets.h"
@@ -41,442 +43,538 @@ struct IntuitionBase *IntuitionBase;
 struct GfxBase       *GfxBase;
 struct DosLibrary    *DOSBase;
 
-/* ------------------------------------------------------------------ */
-/* asset pieces                                                       */
+#define DEPTH       4                   /* bitplanes per playfield */
+#define ROWB        42                  /* 21 fetched words per line */
+#define EXTRA       32768UL             /* scroll headroom per plane */
+#define GUARD       64UL                /* zero bytes before each plane */
+#define WMAX        ((LONG)(EXTRA / 2) - 32)
+#define PERIOD_Q    ((ULONG)PERIOD_WORDS * 64UL)
+#define TEXT_ROWS   (TITLE_H + 2)
+#define TEXT_PLANE  ((ULONG)TEXT_ROWS * ROWB)
+#define COP_WORDS   2048
+
+#define DISP_TOP    0x3A
+#define SCENE_TOP   (DISP_TOP + TITLE_H)
+
+#define R_DIWSTRT   0x08E
+#define R_DIWSTOP   0x090
+#define R_DDFSTRT   0x092
+#define R_DDFSTOP   0x094
+#define R_BPL1PTH   0x0E0
+#define R_BPLCON0   0x100
+#define R_BPLCON1   0x102
+#define R_BPLCON2   0x104
+#define R_BPLCON3   0x106
+#define R_BPL1MOD   0x108
+#define R_BPL2MOD   0x10A
+#define R_BPLCON4   0x10C
+#define R_SPR0PTH   0x120
+#define R_COLOR00   0x180
+#define R_FMODE     0x1FC
+
+#define BPLCON0_VAL 0x0611              /* 8 planes, dual playfield, ECSENA */
+#define BPLCON3_VAL 0x1020              /* PF2 colours from 16, border blank */
+#define BPLCON3_BK1 0x3020              /* same, colour bank 32-63 */
 
 typedef struct {
-    UWORD  y;            /* screen row of the first strip row */
-    UWORD  h;            /* number of rows */
-    UBYTE *planes[DEPTH];
-    UBYTE *mask;         /* NULL for opaque parts */
-} Part;
+    UBYTE *strip[DEPTH];
+    UBYTE *mem[DEPTH];
+    UBYTE *base[DEPTH];
+    ULONG  size;
+    UWORD  h;
+    UWORD  speed;                       /* quarter pixels per frame */
+    ULONG  pos;                         /* quarter pixels */
+    LONG   filled;                      /* last column in the buffer */
+} Layer;
 
-static UBYTE *asset = NULL;       /* whole data file, chip RAM */
-static struct ColorSpec colors[NCOL + 1];
-static Part midPart, nearMaskPart, nearOpaquePart;
+typedef struct {
+    UWORD *list;
+    UWORD *pf1;                         /* PF1 pointer moves */
+    UWORD *pf2;                         /* PF2 pointer moves */
+    UWORD *con1;                        /* BPLCON1 value word */
+} Copper;
 
-/* ------------------------------------------------------------------ */
-/* little helpers                                                     */
-
-/* the blitter register write must not be interrupted by another task's
- * blit; we own the blitter for the whole run, so a plain WaitBlit is
- * enough between operations. */
-
-#define BLIT_BYTES  ((WIN_W + 32) / 8)   /* 22 words = 352 px */
-
-static void blit_opaque(struct BitMap *bm, Part *pt, int plane, UWORD px)
-{
-    UWORD shift     = px & 15;
-    int   src_word  = (px >> 4) - (shift == 0 ? 1 : 0);
-    UWORD dst_mod   = bm->BytesPerRow - BLIT_BYTES;
-    ULONG dst       = (ULONG)bm->Planes[plane] +
-                      (ULONG)pt->y * bm->BytesPerRow;
-    UBYTE *src      = pt->planes[plane] + src_word * 2;
-
-    CHIP->bltcon0 = (shift << 12) | 0x09F0;  /* A -> D */
-    CHIP->bltcon1 = 0;
-    CHIP->bltafwm = 0xFFFF;
-    CHIP->bltalwm = 0xFFFF;
-    CHIP->bltamod = STRIP_BYTES - BLIT_BYTES;
-    CHIP->bltdmod = dst_mod;
-    CHIP->bltapt  = (APTR)src;
-    CHIP->bltdpt  = (APTR)dst;
-    CHIP->bltsize = (pt->h << 6) | (BLIT_BYTES / 2);
-    WaitBlit();
-}
-
-static void blit_masked(struct BitMap *bm, Part *pt, int plane, UWORD px)
-{
-    UWORD shift     = px & 15;
-    int   src_word  = (px >> 4) - (shift == 0 ? 1 : 0);
-    UWORD dst_mod   = bm->BytesPerRow - BLIT_BYTES;
-    ULONG dst       = (ULONG)bm->Planes[plane] +
-                      (ULONG)pt->y * bm->BytesPerRow;
-    UBYTE *src      = pt->planes[plane] + src_word * 2;
-    UBYTE *mask     = pt->mask + src_word * 2;
-
-    CHIP->bltcon0 = (shift << 12) | 0x0FE2;  /* (A & B) | (C & ~B) */
-    CHIP->bltcon1 = 0;
-    CHIP->bltafwm = 0xFFFF;
-    CHIP->bltalwm = 0xFFFF;
-    CHIP->bltamod = STRIP_BYTES - BLIT_BYTES;
-    CHIP->bltbmod = STRIP_BYTES - BLIT_BYTES;
-    CHIP->bltcmod = dst_mod;
-    CHIP->bltdmod = dst_mod;
-    CHIP->bltapt  = (APTR)src;
-    CHIP->bltbpt  = (APTR)mask;
-    CHIP->bltcpt  = (APTR)dst;
-    CHIP->bltdpt  = (APTR)dst;
-    CHIP->bltsize = (pt->h << 6) | (BLIT_BYTES / 2);
-    WaitBlit();
-}
-
-static void draw_part(struct BitMap *bm, Part *pt, UWORD px)
-{
-    int p;
-    for (p = 0; p < DEPTH; p++) {
-        if (pt->mask)
-            blit_masked(bm, pt, p, px);
-        else
-            blit_opaque(bm, pt, p, px);
-    }
-}
-
-/* fill the 16-pixel side borders with colour 0 */
-static void clear_borders(struct BitMap *bm)
-{
-    int p, side;
-    UWORD right_word = (WIN_X + WIN_W) / 16;   /* word 21 = x 336 */
-
-    for (p = 0; p < DEPTH; p++) {
-        for (side = 0; side < 2; side++) {
-            ULONG dst = (ULONG)bm->Planes[p] +
-                        (ULONG)(side ? right_word : 0) * 2;
-            CHIP->bltcon0 = 0x0100;          /* D only, minterm 0 */
-            CHIP->bltcon1 = 0;
-            CHIP->bltdmod = bm->BytesPerRow - 2;
-            CHIP->bltdpt  = (APTR)dst;
-            CHIP->bltsize = (SCREEN_H << 6) | 1;
-            WaitBlit();
-        }
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/* text                                                               */
-
-static void draw_text(struct Screen *scr, struct BitMap *bm,
-                      int x, int y, const char *s, int pen)
-{
-    struct RastPort rp;
-    InitRastPort(&rp);
-    rp.BitMap = bm;
-    SetFont(&rp, scr->RastPort.Font ? scr->RastPort.Font : GfxBase->DefaultFont);
-    SetAPen(&rp, pen);
-    SetBPen(&rp, 0);
-    SetDrMd(&rp, JAM1);
-    Move(&rp, x, y);
-    Text(&rp, (CONST_STRPTR)s, (LONG)strlen(s));
-}
-
-/* ------------------------------------------------------------------ */
-/* background copy                                                    */
-
-static void copy_background(struct BitMap *bm)
-{
-    int p, row;
-    int src_stride = SCREEN_W / 8;
-    int pl_size = BG_SIZE / DEPTH;
-
-    for (p = 0; p < DEPTH; p++) {
-        UBYTE *src = asset + BG_OFFSET + p * pl_size;
-        UBYTE *dst = (UBYTE *)bm->Planes[p];
-        if (bm->BytesPerRow == src_stride) {
-            CopyMem(src, dst, (ULONG)src_stride * SCREEN_H);
-        } else {
-            for (row = 0; row < SCREEN_H; row++)
-                CopyMem(src + row * src_stride,
-                        dst + row * bm->BytesPerRow, src_stride);
-        }
-    }
-}
+static UBYTE *asset;
+static UBYTE *textmem;
+static UWORD *spritemem;
+static UWORD *sprite[SUN_SPRITES];
+static UWORD *nullspr;
+static UWORD *copmem[2];
+static Copper cop[2];
+static Layer  mid, fg;
+static UWORD *clp;
+static int    cl_wrapped;
+static struct BitMap   textbm;
+static struct RastPort textrp;
+static struct TextFont *topaz8;
+static struct TextAttr topaz8_attr = {
+    (STRPTR)"topaz.font", 8, FS_NORMAL, FPF_ROMFONT
+};
 
 /* ------------------------------------------------------------------ */
 /* loading                                                            */
 
-static UBYTE *load_asset(ULONG *size_out)
+static UBYTE *load_asset(void)
 {
     static const char *paths[] = {
-        "parallax/data/parallax.dat",       /* boot disk root / cwd */
-        "Work:parallax/data/parallax.dat",  /* DevBench Work: share */
-        "data/parallax.dat",                /* cwd = program drawer */
+        "parallax/data/parallax.dat",
+        "Work:parallax/data/parallax.dat",
+        "data/parallax.dat",
         NULL
     };
     BPTR fh = 0;
-    LONG total;
+    LONG total = 0;
     UBYTE *mem;
     int i;
 
-    for (i = 0; paths[i]; i++) {
+    for (i = 0; paths[i] && !fh; i++)
         fh = Open((STRPTR)paths[i], MODE_OLDFILE);
-        if (fh)
-            break;
-    }
     if (!fh)
         return NULL;
     mem = (UBYTE *)AllocMem(ASSET_SIZE, MEMF_CHIP | MEMF_CLEAR);
-    if (!mem) {
-        Close(fh);
-        return NULL;
-    }
-    total = 0;
-    while (total < ASSET_SIZE) {
-        LONG n = Read(fh, mem + total, ASSET_SIZE - total);
-        if (n <= 0)
-            break;
-        total += n;
+    if (mem) {
+        while (total < ASSET_SIZE) {
+            LONG n = Read(fh, mem + total, ASSET_SIZE - total);
+            if (n <= 0)
+                break;
+            total += n;
+        }
     }
     Close(fh);
-    if (total != ASSET_SIZE) {
+    if (mem && (total != ASSET_SIZE || memcmp(mem, "PLX2", 4) != 0)) {
         FreeMem(mem, ASSET_SIZE);
-        return NULL;
+        mem = NULL;
     }
-    if (memcmp(mem, "PLX1", 4) != 0) {
-        FreeMem(mem, ASSET_SIZE);
-        return NULL;
-    }
-    *size_out = ASSET_SIZE;
     return mem;
+}
+
+/* ------------------------------------------------------------------ */
+/* scrolling layers                                                   */
+
+static int layer_init(Layer *L, UBYTE *strip0, UWORD h, UWORD speed)
+{
+    int p;
+
+    L->h = h;
+    L->speed = speed;
+    L->pos = 0;
+    L->filled = -1;
+    L->size = GUARD + (ULONG)(h + 1) * ROWB + EXTRA;
+    for (p = 0; p < DEPTH; p++) {
+        L->strip[p] = strip0 + (ULONG)p * STRIP_BYTES * h;
+        L->mem[p] = (UBYTE *)AllocMem(L->size, MEMF_CHIP | MEMF_CLEAR);
+        if (!L->mem[p])
+            return 0;
+        L->base[p] = L->mem[p] + GUARD;
+    }
+    return 1;
+}
+
+static void layer_free(Layer *L)
+{
+    int p;
+    for (p = 0; p < DEPTH; p++)
+        if (L->mem[p])
+            FreeMem(L->mem[p], L->size);
+}
+
+/* first fetched word and BPLCON1 delay (quarter pixels) for a position */
+static LONG pos_word(ULONG pos, UWORD *delay)
+{
+    UWORD d = (UWORD)(-(LONG)pos) & 63;
+    if (delay)
+        *delay = d;
+    return (LONG)((pos + d) >> 6);
+}
+
+/* copy 16-pixel column c of the layer into the buffer (all rows) */
+static void fill_column(Layer *L, LONG c)
+{
+    UWORD s = (UWORD)((c + PERIOD_WORDS - 1) % PERIOD_WORDS);
+    int p;
+
+    for (p = 0; p < DEPTH; p++) {
+        WaitBlit();
+        CHIP->bltcon0 = 0x09F0;         /* A -> D */
+        CHIP->bltcon1 = 0;
+        CHIP->bltafwm = 0xFFFF;
+        CHIP->bltalwm = 0xFFFF;
+        CHIP->bltamod = STRIP_BYTES - 2;
+        CHIP->bltdmod = ROWB - 2;
+        CHIP->bltapt  = (APTR)(L->strip[p] + s * 2);
+        CHIP->bltdpt  = (APTR)(L->base[p] + c * 2);
+        CHIP->bltsize = (UWORD)((L->h << 6) | 1);
+    }
+}
+
+/* make sure every column fetched at L->pos is in the buffer */
+static void layer_prepare(Layer *L)
+{
+    LONG w = pos_word(L->pos, NULL);
+
+    if (w > WMAX) {
+        /* end of the headroom: jump back by whole periods (same picture)
+         * and rebuild the window in the untouched start of the buffer */
+        L->pos %= PERIOD_Q;
+        w = pos_word(L->pos, NULL);
+        L->filled = w - 1;
+    }
+    if (L->filled < w - 1)
+        L->filled = w - 1;
+    while (L->filled < w + 20)
+        fill_column(L, ++L->filled);
+}
+
+/* ------------------------------------------------------------------ */
+/* copper lists                                                       */
+
+static void cmove(UWORD reg, UWORD val)
+{
+    *clp++ = reg;
+    *clp++ = val;
+}
+
+static void cwait(int line, int hp)
+{
+    if (line >= 256 && !cl_wrapped) {
+        *clp++ = 0xFFDF;
+        *clp++ = 0xFFFE;
+        cl_wrapped = 1;
+    }
+    *clp++ = (UWORD)(((line & 0xFF) << 8) | (hp & 0xFE) | 1);
+    *clp++ = 0xFFFE;
+    if (line == 255 && hp >= 0xDE)
+        cl_wrapped = 1;
+}
+
+static void cmove_ptr(UWORD reg, ULONG addr)
+{
+    cmove(reg, (UWORD)(addr >> 16));
+    cmove(reg + 2, (UWORD)addr);
+}
+
+static void build_copper(Copper *cp, UWORD *mem)
+{
+    int i, k, y;
+
+    clp = mem;
+    cl_wrapped = 0;
+    cp->list = mem;
+
+    cmove(R_BPLCON0, BPLCON0_VAL);
+    cmove(R_BPLCON2, 0x0000);           /* playfields in front of sprites */
+    cmove(R_BPLCON3, BPLCON3_VAL);
+    cmove(R_BPLCON4, 0x0022);           /* sprite colours from 32 */
+    cmove(R_FMODE, 0x0000);
+    cmove(R_DIWSTRT, (DISP_TOP << 8) | 0x81);
+    cmove(R_DIWSTOP, (((SCENE_TOP + SCENE_H) & 0xFF) << 8) | 0xC1);
+    cmove(R_DDFSTRT, 0x0030);           /* one extra word for fine scroll */
+    cmove(R_DDFSTOP, 0x00D0);
+    cmove(R_BPLCON1, 0);
+    cmove(R_BPL1MOD, 0);
+    cmove(R_BPL2MOD, (UWORD)-ROWB);
+
+    for (i = 0; i < 8; i++)
+        cmove_ptr(R_SPR0PTH + i * 4,
+                  (ULONG)(i < SUN_SPRITES ? sprite[i] : nullspr));
+
+    cmove(R_COLOR00, 0x000);
+    for (i = 1; i < 16; i++)
+        cmove(R_COLOR00 + i * 2, pf1_colors[i]);
+    for (i = 1; i < 16; i++)
+        cmove(R_COLOR00 + (16 + i) * 2, pf2_colors[i]);
+    cmove(R_BPLCON3, BPLCON3_BK1);
+    for (i = 1; i < 4; i++) {
+        cmove(R_COLOR00 + i * 2, sun_colors[i]);         /* 33-35 */
+        cmove(R_COLOR00 + (4 + i) * 2, sun_colors[i]);   /* 37-39 */
+    }
+    cmove(R_BPLCON3, BPLCON3_VAL);
+
+    /* title band: PF1 shows the text bitmap, PF2 an empty row */
+    for (k = 0; k < DEPTH; k++)
+        cmove_ptr(R_BPL1PTH + (2 * k) * 4, (ULONG)textmem + k * TEXT_PLANE);
+    cp->pf2 = clp;
+    for (k = 0; k < DEPTH; k++)
+        cmove_ptr(R_BPL1PTH + (2 * k + 1) * 4, 0);
+
+    for (y = 0; y < SCENE_H; y++) {
+        cwait(SCENE_TOP + y - 1, 0xDF);
+        cmove(R_COLOR00, sky_colors[y]);
+        if (y == 0) {
+            /* PF1 repeats the (empty) row above the foreground buffer */
+            cmove(R_BPL1MOD, (UWORD)-ROWB);
+            cp->con1 = clp + 1;
+            cmove(R_BPLCON1, 0);
+            cp->pf1 = clp;
+            for (k = 0; k < DEPTH; k++)
+                cmove_ptr(R_BPL1PTH + (2 * k) * 4, 0);
+        }
+        if (y == MID_Y0 - 1)
+            cmove(R_BPL2MOD, 0);        /* PF2 starts walking its buffer */
+        if (y == FG_Y0 - 1)
+            cmove(R_BPL1MOD, 0);        /* PF1 starts walking its buffer */
+    }
+    *clp++ = 0xFFFF;
+    *clp++ = 0xFFFE;
+}
+
+static void set_ptrs(UWORD *moves, Layer *L, LONG w)
+{
+    int k;
+    for (k = 0; k < DEPTH; k++) {
+        ULONG a = (ULONG)L->base[k] + (ULONG)(w * 2) - ROWB;
+        moves[k * 4 + 1] = (UWORD)(a >> 16);
+        moves[k * 4 + 3] = (UWORD)a;
+    }
+}
+
+static void update_copper(Copper *cp)
+{
+    UWORD dm, df;
+    LONG wm = pos_word(mid.pos, &dm);
+    LONG wf = pos_word(fg.pos, &df);
+
+    set_ptrs(cp->pf2, &mid, wm);
+    set_ptrs(cp->pf1, &fg, wf);
+    *cp->con1 = (UWORD)(((df >> 2) & 15) | (((dm >> 2) & 15) << 4) |
+                        ((df & 3) << 8) | ((dm & 3) << 12));
+}
+
+/* ------------------------------------------------------------------ */
+/* sprites and text                                                   */
+
+static int build_sprites(void)
+{
+    ULONG words = (ULONG)SUN_SPRITES * (SUN_H * 2 + 4) + 4;
+    int s;
+
+    spritemem = (UWORD *)AllocMem(words * 2, MEMF_CHIP | MEMF_CLEAR);
+    if (!spritemem)
+        return 0;
+    for (s = 0; s < SUN_SPRITES; s++) {
+        UWORD *sp = spritemem + s * (SUN_H * 2 + 4);
+        UWORD hs = 0x80 + SUN_X + s * 16;
+        UWORD vs = SCENE_TOP + SUN_Y;
+        UWORD ve = vs + SUN_H;
+
+        sprite[s] = sp;
+        sp[0] = (UWORD)(((vs & 0xFF) << 8) | ((hs >> 1) & 0xFF));
+        sp[1] = (UWORD)(((ve & 0xFF) << 8) | (((vs >> 8) & 1) << 2) |
+                        (((ve >> 8) & 1) << 1) | (hs & 1));
+        CopyMem(asset + OFF_SUN + (ULONG)s * SUN_H * 4, sp + 2, SUN_H * 4);
+    }
+    nullspr = spritemem + SUN_SPRITES * (SUN_H * 2 + 4);
+    return 1;
+}
+
+static void text_centered(int y, const char *s)
+{
+    int len = (int)strlen(s);
+    int w = TextLength(&textrp, (CONST_STRPTR)s, len);
+    Move(&textrp, 16 + (SCENE_W - w) / 2, y);
+    Text(&textrp, (CONST_STRPTR)s, len);
+}
+
+static int build_text(void)
+{
+    int k;
+
+    textmem = (UBYTE *)AllocMem(DEPTH * TEXT_PLANE, MEMF_CHIP | MEMF_CLEAR);
+    if (!textmem)
+        return 0;
+    InitBitMap(&textbm, DEPTH, ROWB * 8, TEXT_ROWS);
+    for (k = 0; k < DEPTH; k++)
+        textbm.Planes[k] = textmem + k * TEXT_PLANE;
+    InitRastPort(&textrp);
+    textrp.BitMap = &textbm;
+    topaz8 = OpenFont(&topaz8_attr);
+    SetFont(&textrp, topaz8 ? topaz8 : GfxBase->DefaultFont);
+    SetAPen(&textrp, TEXT_PEN);
+    SetDrMd(&textrp, JAM1);
+    text_centered(11, "PARALLAX  //  BLITTER + COPPER SCROLL");
+    text_centered(23, "A1200 AGA  DUAL PLAYFIELD  50 FPS");
+    WaitBlit();
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* stats (test mode only)                                             */
+
+static char *put_num(char *q, ULONG v)
+{
+    char tmp[12];
+    int n = 0;
+    do {
+        tmp[n++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v);
+    while (n)
+        *q++ = tmp[--n];
+    return q;
+}
+
+static void write_stats(ULONG frames, ULONG ticks)
+{
+    char buf[64];
+    char *q = buf;
+    BPTR fh;
+
+    memcpy(q, "frames=", 7);  q = put_num(q + 7, frames);
+    memcpy(q, " ticks=", 7);  q = put_num(q + 7, ticks);
+    *q++ = '\n';
+    fh = Open((STRPTR)"Work:parallax/stats.txt", MODE_NEWFILE);
+    if (fh) {
+        Write(fh, buf, q - buf);
+        Close(fh);
+    }
 }
 
 /* ------------------------------------------------------------------ */
 /* main                                                               */
 
-static int demo_run(void)
+int main(int argc, char **argv)
 {
-    struct Screen   *scr;
-    struct Window   *win;
-    struct BitMap   *buf[2];
-    struct DBufInfo *dbi;
-    struct MsgPort  *safePort, *dispPort;
-    ULONG asset_size = 0;
-    ULONG mid_acc = 0, near_acc = 0;
-    UWORD mid_px = 0, near_px = 0;
-    int running = 1;
-    int back = 1;
-    struct DateStamp ds;
-    ULONG last_tick;
-    int i, p;
-    UWORD mid_drawn[2];
+    struct Screen *scr = NULL;
+    struct Window *win = NULL;
+    struct View *oldview;
+    struct DateStamp ds0, ds1;
+    ULONG frames = 0;
+    int running = 1, cur = 0, test_rebase = 0, stats = 0, i;
 
     IntuitionBase = (struct IntuitionBase *)OpenLibrary((CONST_STRPTR)"intuition.library", 39);
     GfxBase       = (struct GfxBase *)OpenLibrary((CONST_STRPTR)"graphics.library", 39);
     DOSBase       = (struct DosLibrary *)OpenLibrary((CONST_STRPTR)"dos.library", 37);
     if (!IntuitionBase || !GfxBase || !DOSBase)
-        return 1;
+        return 20;
+    if ((CHIP->deniseid & 0xFF) != 0xF8)
+        return 20;                      /* needs AGA (Lisa) */
 
-    /* never pop an "insert volume Work" requester on a floppy/HDF boot */
+    /* never pop an "insert volume" requester on a floppy/HDF boot */
     ((struct Process *)FindTask(NULL))->pr_WindowPtr = (APTR)-1;
 
-    /* stay below the bridge/serial task so the dev channel keeps running */
-    SetTaskPri(FindTask(NULL), -10);
-
-    asset = load_asset(&asset_size);
-    if (!asset) {
-        /* best effort: say something on the default screen */
-        struct RastPort *rp;
-        struct Screen *ws = LockPubScreen(NULL);
-        if (ws) {
-            rp = &ws->RastPort;
-            SetAPen(rp, 1);
-            Move(rp, 20, 20);
-            Text(rp, (CONST_STRPTR)"parallax.dat not found", 22);
-            UnlockPubScreen(NULL, ws);
-        }
-        Delay(500);
-        return 1;
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "rebase") == 0)
+            test_rebase = 1;
+        if (strcmp(argv[i], "stats") == 0)
+            stats = 1;
     }
 
-
-    /* palette */
-    for (i = 0; i < NCOL; i++) {
-        colors[i].ColorIndex = i;
-        colors[i].Red   = (palette[i] >> 8) & 15;
-        colors[i].Green = (palette[i] >> 4) & 15;
-        colors[i].Blue  = palette[i] & 15;
+    asset = load_asset();
+    if (!asset)
+        goto out;
+    for (i = 0; i < 2; i++) {
+        copmem[i] = (UWORD *)AllocMem(COP_WORDS * 2, MEMF_CHIP | MEMF_CLEAR);
+        if (!copmem[i])
+            goto out;
     }
-    colors[NCOL].ColorIndex = -1;
+    if (!layer_init(&mid, asset + OFF_MID, MID_H, MID_SPEED) ||
+        !layer_init(&fg, asset + OFF_FG, FG_H, FG_SPEED) ||
+        !build_sprites() || !build_text())
+        goto out;
+    if (test_rebase) {
+        mid.pos = (ULONG)(WMAX - 12) * 64;
+        fg.pos = (ULONG)(WMAX - 24) * 64;
+    }
+    build_copper(&cop[0], copmem[0]);
+    build_copper(&cop[1], copmem[1]);
 
+    /* a quiet screen + window only to receive keyboard and mouse input */
     scr = OpenScreenTags(NULL,
-        SA_Width,   SCREEN_W,
-        SA_Height,  SCREEN_H,
-        SA_Depth,   DEPTH,
-        SA_Type,    CUSTOMSCREEN,
-        SA_Title,   (ULONG)"Parallax",
-        SA_ShowTitle, FALSE,
-        SA_Quiet,   TRUE,
-        SA_Colors,  (ULONG)colors,
+        SA_Width, 320, SA_Height, 200, SA_Depth, 1,
+        SA_Type, CUSTOMSCREEN, SA_Quiet, TRUE, SA_ShowTitle, FALSE,
         TAG_DONE);
-    if (!scr) {
-        FreeMem(asset, asset_size);
-        return 1;
-    }
-
-
-    buf[0] = scr->RastPort.BitMap;
-    buf[1] = AllocBitMap(SCREEN_W, SCREEN_H, DEPTH,
-                         BMF_DISPLAYABLE | BMF_MINPLANES | BMF_CLEAR,
-                         buf[0]);
-    if (!buf[1] || buf[0]->BytesPerRow != SCREEN_W / 8 ||
-        buf[1]->BytesPerRow != buf[0]->BytesPerRow) {
-        if (buf[1]) FreeBitMap(buf[1]);
-        CloseScreen(scr);
-        FreeMem(asset, asset_size);
-        return 1;
-    }
-
-
-    dbi = AllocDBufInfo(&scr->ViewPort);
-    safePort = CreateMsgPort();
-    dispPort = CreateMsgPort();
-    if (!dbi || !safePort || !dispPort) {
-        if (dbi) FreeDBufInfo(dbi);
-        if (safePort) DeleteMsgPort(safePort);
-        if (dispPort) DeleteMsgPort(dispPort);
-        FreeBitMap(buf[1]);
-        CloseScreen(scr);
-        FreeMem(asset, asset_size);
-        return 1;
-    }
-    dbi->dbi_SafeMessage.mn_ReplyPort = safePort;
-    dbi->dbi_DispMessage.mn_ReplyPort = dispPort;
-
-
-    /* layer descriptors (offsets relative to the asset file) */
-    midPart.y      = P_MID_OPAQUE_Y;
-    midPart.h      = P_MID_OPAQUE_H;
-    midPart.mask   = NULL;
-    for (p = 0; p < DEPTH; p++)
-        midPart.planes[p] = asset + P_MID_OPAQUE_OFF + p * P_MID_OPAQUE_PLANESZ;
-
-    nearMaskPart.y    = P_NEAR_MASK_Y;
-    nearMaskPart.h    = P_NEAR_MASK_H;
-    nearMaskPart.mask = asset + P_NEAR_MASK_MASK;
-    for (p = 0; p < DEPTH; p++)
-        nearMaskPart.planes[p] = asset + P_NEAR_MASK_OFF + p * P_NEAR_MASK_PLANESZ;
-
-    nearOpaquePart.y    = P_NEAR_OPAQUE_Y;
-    nearOpaquePart.h    = P_NEAR_OPAQUE_H;
-    nearOpaquePart.mask = NULL;
-    for (p = 0; p < DEPTH; p++)
-        nearOpaquePart.planes[p] = asset + P_NEAR_OPAQUE_OFF + p * P_NEAR_OPAQUE_PLANESZ;
-
-    /* input window */
+    if (!scr)
+        goto out;
     win = OpenWindowTags(NULL,
         WA_CustomScreen, (ULONG)scr,
-        WA_Left, 0, WA_Top, 0,
-        WA_Width, SCREEN_W, WA_Height, SCREEN_H,
-        WA_Borderless, TRUE,
-        WA_Backdrop, TRUE,
-        WA_Activate, TRUE,
+        WA_Left, 0, WA_Top, 0, WA_Width, 320, WA_Height, 200,
+        WA_Borderless, TRUE, WA_Backdrop, TRUE, WA_Activate, TRUE,
         WA_RMBTrap, TRUE,
         WA_IDCMP, IDCMP_RAWKEY | IDCMP_MOUSEBUTTONS,
         TAG_DONE);
-    if (!win) {
-        FreeDBufInfo(dbi);
-        DeleteMsgPort(safePort);
-        DeleteMsgPort(dispPort);
-        FreeBitMap(buf[1]);
-        CloseScreen(scr);
-        FreeMem(asset, asset_size);
-        return 1;
-    }
-    ClearPointer(win);
+    if (!win)
+        goto out;
 
-    /* both buffers start with the static background + titles */
-    copy_background(buf[0]);
-    copy_background(buf[1]);
-    draw_text(scr, buf[0], 20, 16, "PARALLAX  //  BLITTER SCROLLING", 17);
-    draw_text(scr, buf[1], 20, 16, "PARALLAX  //  BLITTER SCROLLING", 17);
-    draw_text(scr, buf[0], 20, 250, "AMIGA 1200   AGA   32 COLOURS", 2);
-    draw_text(scr, buf[1], 20, 250, "AMIGA 1200   AGA   32 COLOURS", 2);
+    SetTaskPri(FindTask(NULL), 5);
 
+    OwnBlitter();
+    layer_prepare(&mid);
+    layer_prepare(&fg);
+    WaitBlit();
+    DisownBlitter();
+    update_copper(&cop[0]);
 
-    mid_drawn[0] = mid_drawn[1] = 0xFFFF;
+    oldview = GfxBase->ActiView;
+    LoadView(NULL);
+    WaitTOF();
+    WaitTOF();
+    CHIP->cop1lc = (ULONG)cop[0].list;
+    DateStamp(&ds0);
 
-    DateStamp(&ds);
-    last_tick = ds.ds_Tick;
-
-    /* let the blitter win chip-bus arbitration */
-    CHIP->dmacon = 0x8400;      /* set BLTPRI */
-
-    /* main loop */
     while (running) {
         struct IntuiMessage *msg;
-        ULONG sigs;
+
+        WaitTOF();                      /* cop[cur] is now on screen */
 
         while ((msg = (struct IntuiMessage *)GetMsg(win->UserPort)) != NULL) {
             ULONG cls = msg->Class;
             UWORD code = msg->Code;
             ReplyMsg((struct Message *)msg);
-            if (cls == IDCMP_RAWKEY && code == 0x45)   /* ESC */
+            if ((cls == IDCMP_RAWKEY && code == 0x45) ||
+                (cls == IDCMP_MOUSEBUTTONS && code == SELECTDOWN))
                 running = 0;
         }
-        sigs = SetSignal(0L, 0L);
-        if (sigs & SIGBREAKF_CTRL_C)
+        if (SetSignal(0L, 0L) & SIGBREAKF_CTRL_C)
             running = 0;
-        if (!running)
-            break;
 
-        /* advance scroll by elapsed 50 Hz ticks: constant pixels/second
-         * regardless of the actual frame rate */
-        {
-            ULONG now;
-            LONG dt;
-            DateStamp(&ds);
-            now = ds.ds_Tick;
-            dt = now - (LONG)last_tick;
-            if (dt < 0)
-                dt += 3000;
-            if (dt > 10)
-                dt = 10;
-            last_tick = now;
-            if (dt) {
-                mid_acc += (ULONG)dt * MID_SPEED;
-                mid_px += (UWORD)(mid_acc >> 16);
-                mid_acc &= 0xFFFF;
-                while (mid_px >= PERIOD) mid_px -= PERIOD;
-
-                near_acc += (ULONG)dt * NEAR_SPEED;
-                near_px += (UWORD)(near_acc >> 16);
-                near_acc &= 0xFFFF;
-                while (near_px >= PERIOD) near_px -= PERIOD;
-            }
-        }
-
-        /* compose into the back buffer; the mid layer only needs a
-         * redraw when its integer offset changed for this buffer */
-        if (mid_drawn[back] != mid_px) {
-            draw_part(buf[back], &midPart, mid_px);
-            mid_drawn[back] = mid_px;
-        }
-        draw_part(buf[back], &nearMaskPart, near_px);
-        draw_part(buf[back], &nearOpaquePart, near_px);
-        clear_borders(buf[back]);
+        /* next frame: stream the new columns, then patch the idle list */
+        mid.pos += mid.speed;
+        fg.pos += fg.speed;
+        OwnBlitter();
+        layer_prepare(&mid);
+        layer_prepare(&fg);
         WaitBlit();
+        DisownBlitter();
 
-        /* flip on the next vertical blank. With two buffers the back
-         * buffer is the previous front and is already safe to write. */
-        while (GetMsg(safePort)) ;
-        while (GetMsg(dispPort)) ;
-        WaitTOF();
-        ChangeVPBitMap(&scr->ViewPort, buf[back], dbi);
-        back ^= 1;
-
+        cur ^= 1;
+        update_copper(&cop[cur]);
+        CHIP->cop1lc = (ULONG)cop[cur].list;
+        frames++;
     }
 
-    /* shutdown: drain pending buffer messages, then release them */
-    while (GetMsg(safePort)) ;
-    while (GetMsg(dispPort)) ;
-    CHIP->dmacon = 0x0400;      /* clear BLTPRI */
-    WaitBlit();
+    DateStamp(&ds1);
+    CHIP->cop1lc = (ULONG)GfxBase->copinit;
+    LoadView(oldview);
+    WaitTOF();
+    WaitTOF();
+    RethinkDisplay();
 
-    FreeDBufInfo(dbi);
-    DeleteMsgPort(safePort);
-    DeleteMsgPort(dispPort);
-    CloseWindow(win);
-    CloseScreen(scr);
-    FreeBitMap(buf[1]);
+    if (stats)
+        write_stats(frames,
+                    (ULONG)((ds1.ds_Days - ds0.ds_Days) * 24L * 60 * 60 * 50 +
+                            (ds1.ds_Minute - ds0.ds_Minute) * 60L * 50 +
+                            (ds1.ds_Tick - ds0.ds_Tick)));
 
-    FreeMem(asset, asset_size);
-
+out:
+    if (win)
+        CloseWindow(win);
+    if (scr)
+        CloseScreen(scr);
+    layer_free(&mid);
+    layer_free(&fg);
+    if (topaz8)
+        CloseFont(topaz8);
+    if (textmem)
+        FreeMem(textmem, DEPTH * TEXT_PLANE);
+    if (spritemem)
+        FreeMem(spritemem, ((ULONG)SUN_SPRITES * (SUN_H * 2 + 4) + 4) * 2);
+    for (i = 0; i < 2; i++)
+        if (copmem[i])
+            FreeMem(copmem[i], COP_WORDS * 2);
+    if (asset)
+        FreeMem(asset, ASSET_SIZE);
     CloseLibrary((struct Library *)DOSBase);
     CloseLibrary((struct Library *)GfxBase);
     CloseLibrary((struct Library *)IntuitionBase);
     return 0;
-}
-
-int main(void)
-{
-    return demo_run();
 }
