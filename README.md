@@ -5,7 +5,7 @@ using the war-torn background art from
 `craftpix-771800-free-war-pixel-art-2d-game-backgrounds.zip`
 (the **War1 / Bright** layer set: sky, sun, ruins, houses, road, fence, craters).
 
-![demo](build/screenshot.png)
+![demo](docs/screenshot.png)
 
 ## What you see
 
@@ -31,8 +31,26 @@ using the war-torn background art from
 
 ## Build
 
-The source is in [`src/`](src). It builds with the
-`amigadev/crosstools:m68k-amigaos` Docker image:
+From the repository root:
+
+```sh
+make adf       # build build/parallax-demo.adf (default target)
+make hdf       # build build/parallax-demo.hdf
+```
+
+`make` extracts the supplied zip into `assets/` (once), regenerates the planar
+assets and `src/assets.h`, cross-compiles the demo in the
+`amigadev/crosstools:m68k-amigaos` Docker image, and creates the bootable image
+with amitools.
+
+Requirements: Docker, `python3` + Pillow, `unzip`, and amitools
+(`xdftool`/`rdbtool`). If amitools is installed in a virtualenv:
+
+```sh
+make adf AMITOOLS_PY=/path/to/python-with-amitools
+```
+
+The direct cross-compile is still available:
 
 ```sh
 docker run --rm -v "$PWD/src:/work" -w /work \
@@ -65,10 +83,18 @@ Regenerate with:
 python3 tools/build_assets.py <output-dir>
 ```
 
-The current build artifacts are in [`build/`](build):
-`parallax`, `parallax.dat`, `palette.bin`, `screenshot.png`,
-`parallax-demo.adf` (880 KB bootable floppy) and
-`parallax-demo.hdf` (16 MB bootable RDB hard-disk image).
+or simply:
+
+```sh
+make assets
+```
+
+which also extracts the supplied zip into `assets/` if it is missing.
+
+The build outputs live in `build/` (ignored by git):
+`parallax`, `parallax.dat`, `palette.bin`, `parallax-demo.adf` (880 KB
+bootable floppy) and `parallax-demo.hdf` (16 MB bootable RDB hard-disk image).
+The documentation screenshot is [`docs/screenshot.png`](docs/screenshot.png).
 
 ## Run on the target
 
@@ -84,7 +110,7 @@ directory that contains the data tree.
 
 ## Bootable images
 
-Two ready-to-boot images are included in `build/`:
+Two ready-to-boot images are built by `make adf` / `make hdf`:
 
 * **`parallax-demo.adf`** — 880 KB bootable FFS floppy (volume `Work`).
   Attach as `DF0:` with an Amiga 1200 Kickstart 3.1 ROM and boot.
