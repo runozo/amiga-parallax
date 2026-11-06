@@ -1,0 +1,17 @@
+# Build outputs
+/build/
+/src/assets.h
+/src/*.o
+/src/parallax
+
+# Extracted source art (the zip is tracked)
+/assets/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Editor / OS
+.DS_Store
+*~
