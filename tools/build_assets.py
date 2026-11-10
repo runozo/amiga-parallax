@@ -15,8 +15,15 @@ stored as a planar strip; the demo streams 16-pixel columns out of it with
 the blitter.  Row 0 of every strip is kept empty: the demo relies on it to
 show a transparent playfield above each layer.
 
-Outputs: <outdir>/parallax.dat, <outdir>/palette.bin, src/assets.h and
-previews in <outdir>/preview/.
+Outputs (in <outdir>):
+  layers.bin     mid + fg planar strips, ready to be incbin'd
+  sprites.bin    final 3-sprite sun block + null sprite (control words baked)
+  text.bin       4-plane title bitmap (rendered from the built-in 8x8 font)
+  sky.bin        200 colour words, one per scene line
+  palette.bin    PF1 / PF2 / sun palettes
+  parallax.dat   original PLX2 container (reference / external tools)
+  preview/*.png  what the hardware should display
+and src/assets.h + src/assets.i for the C and assembly sources.
 """
 import os
 import struct
@@ -44,12 +51,50 @@ SUN_X, SUN_Y = 56, 4       # sun position in the scene
 SUN_SPRITES = 3            # 3 x 16 px = 48 px wide
 MID_SPEED = 2              # quarter pixels per frame (0.5 px)
 FG_SPEED = 4               # quarter pixels per frame (1 px)
+TEXT_ROWS = TITLE_H + 2
+ROW_BYTES = 21 * 2         # one display row: 21 fetched words
+TEXT_PLANE = TEXT_ROWS * ROW_BYTES
+DISP_TOP = 58              # display window vertical start
+SCENE_TOP = DISP_TOP + TITLE_H
 
 rng = np.random.default_rng(1234)
 try:
     MEDIANCUT = Image.Quantize.MEDIANCUT
 except AttributeError:
     MEDIANCUT = Image.MEDIANCUT
+
+# ---------------------------------------------------------------- tiny font
+# 5x7 glyphs in an 8x8 cell (one pixel of left padding, one row of leading).
+FONT = {
+    " ": (".....", ".....", ".....", ".....", ".....", ".....", "....."),
+    "A": (".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
+    "B": ("####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."),
+    "C": (".####", "#....", "#....", "#....", "#....", "#....", ".####"),
+    "D": ("####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."),
+    "E": ("#####", "#....", "#....", "####.", "#....", "#....", "#####"),
+    "F": ("#####", "#....", "#....", "####.", "#....", "#....", "#...."),
+    "G": (".####", "#....", "#....", "#.###", "#...#", "#...#", ".####"),
+    "I": ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "#####"),
+    "L": ("#....", "#....", "#....", "#....", "#....", "#....", "#####"),
+    "O": (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
+    "P": ("####.", "#...#", "#...#", "####.", "#....", "#....", "#...."),
+    "R": ("####.", "#...#", "#...#", "####.", "#..#.", "#...#", "#...#"),
+    "S": (".####", "#....", "#....", ".###.", "....#", "....#", "####."),
+    "T": ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."),
+    "U": ("#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
+    "X": ("#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#"),
+    "Y": ("#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."),
+    "0": (".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."),
+    "1": ("..#..", ".##..", "..#..", "..#..", "..#..", "..#..", "#####"),
+    "2": (".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"),
+    "5": ("#####", "#....", "#....", "####.", "....#", "#...#", ".###."),
+    "+": (".....", "..#..", "..#..", "#####", "..#..", "..#..", "....."),
+    "/": ("....#", "....#", "...#.", "..#..", ".#...", "#....", "#...."),
+}
+TEXT_LINES = (
+    ("PARALLAX  //  BLITTER + COPPER SCROLL", 4),
+    ("A1200 AGA  DUAL PLAYFIELD  50 FPS", 16),
+)
 
 
 def load(name):
@@ -213,9 +258,52 @@ data += mid_bytes + fg_bytes + sun_words
 while len(data) % 4:
     data += b"\0"
 
+# ---------------------------------------------------------------- sprites
+# The demo's sprite block: 3 sun sprites (2 control words + 46 rows) with the
+# original 96-word stride, then the null sprite used by sprites 3..7.
+spr_block = bytearray()
+for s in range(SUN_SPRITES):
+    hs = 0x80 + SUN_X + s * 16
+    vs = SCENE_TOP + SUN_Y
+    ve = vs + SUN_D
+    sp0 = ((vs & 0xFF) << 8) | ((hs >> 1) & 0xFF)
+    sp1 = ((ve & 0xFF) << 8) | (((vs >> 8) & 1) << 2) | (((ve >> 8) & 1) << 1) | (hs & 1)
+    spr_block += struct.pack(">HH", sp0, sp1)
+    spr_block += sun_words[s * SUN_D * 4:(s + 1) * SUN_D * 4]
+    spr_block += b"\0\0\0\0"            # 2 words padding to the 96-word stride
+spr_block += b"\0" * 8                  # null sprite (4 words)
+assert len(spr_block) == SUN_SPRITES * (SUN_D * 4 + 8) + 8
+
+# ---------------------------------------------------------------- text
+text_pen = 1 + int(np.argmax([sum(c) for c in pf1_pal]))
+text_mask = np.zeros((TEXT_ROWS, ROW_BYTES * 8), np.uint8)
+for line, y0 in TEXT_LINES:
+    x = 16 + (W - 8 * len(line)) // 2
+    for i, ch in enumerate(line):
+        glyph = FONT[ch]
+        for row in range(7):
+            for col in range(5):
+                if glyph[row][col] == "#":
+                    text_mask[y0 + row, x + i * 8 + 1 + col] = 1
+text_planes = bytearray()
+for p in range(4):
+    plane = text_mask * ((text_pen >> p) & 1)
+    text_planes += np.packbits(plane, axis=1).tobytes()
+assert len(text_planes) == 4 * TEXT_PLANE
+
+# ---------------------------------------------------------------- outputs
 os.makedirs(OUTDIR, exist_ok=True)
 with open(os.path.join(OUTDIR, "parallax.dat"), "wb") as f:
     f.write(data)
+with open(os.path.join(OUTDIR, "layers.bin"), "wb") as f:
+    f.write(mid_bytes + fg_bytes)
+with open(os.path.join(OUTDIR, "sprites.bin"), "wb") as f:
+    f.write(spr_block)
+with open(os.path.join(OUTDIR, "text.bin"), "wb") as f:
+    f.write(text_planes)
+with open(os.path.join(OUTDIR, "sky.bin"), "wb") as f:
+    for c in sky4:
+        f.write(struct.pack(">H", rgb12(c)))
 
 pf1 = [(0, 0, 0)] + list(pf1_pal) + [(0, 0, 0)] * (15 - len(pf1_pal))
 pf2 = [(0, 0, 0)] + list(pf2_pal) + [(0, 0, 0)] * (15 - len(pf2_pal))
@@ -224,8 +312,6 @@ with open(os.path.join(OUTDIR, "palette.bin"), "wb") as f:
     for c in pf1 + pf2 + sunc:
         f.write(struct.pack(">H", rgb12(c)))
 
-text_pen = 1 + int(np.argmax([sum(c) for c in pf1_pal]))
-
 
 def carray(name, cols):
     body = ",".join("0x%03X" % rgb12(c) for c in cols)
@@ -233,22 +319,27 @@ def carray(name, cols):
 
 
 os.makedirs(HDRDIR, exist_ok=True)
+consts = [("SCENE_W", W), ("SCENE_H", H), ("TITLE_H", TITLE_H),
+          ("PERIOD_WORDS", PERIOD_WORDS), ("STRIP_BYTES", STRIP_BYTES),
+          ("MID_Y0", MID_Y0), ("MID_H", MID_H),
+          ("FG_Y0", FG_Y0), ("FG_H", FG_H),
+          ("SUN_H", SUN_D), ("SUN_X", SUN_X), ("SUN_Y", SUN_Y),
+          ("SUN_SPRITES", SUN_SPRITES),
+          ("MID_SPEED", MID_SPEED), ("FG_SPEED", FG_SPEED),
+          ("OFF_MID", OFF_MID), ("OFF_FG", OFF_FG), ("OFF_SUN", OFF_SUN),
+          ("ASSET_SIZE", len(data)), ("TEXT_PEN", text_pen)]
 with open(os.path.join(HDRDIR, "assets.h"), "w") as f:
     f.write("/* generated by tools/build_assets.py -- do not edit */\n")
-    for k, v in [("SCENE_W", W), ("SCENE_H", H), ("TITLE_H", TITLE_H),
-                 ("PERIOD_WORDS", PERIOD_WORDS), ("STRIP_BYTES", STRIP_BYTES),
-                 ("MID_Y0", MID_Y0), ("MID_H", MID_H),
-                 ("FG_Y0", FG_Y0), ("FG_H", FG_H),
-                 ("SUN_H", SUN_D), ("SUN_X", SUN_X), ("SUN_Y", SUN_Y),
-                 ("SUN_SPRITES", SUN_SPRITES),
-                 ("MID_SPEED", MID_SPEED), ("FG_SPEED", FG_SPEED),
-                 ("OFF_MID", OFF_MID), ("OFF_FG", OFF_FG), ("OFF_SUN", OFF_SUN),
-                 ("ASSET_SIZE", len(data)), ("TEXT_PEN", text_pen)]:
+    for k, v in consts:
         f.write("#define %s %d\n" % (k, v))
     f.write(carray("pf1_colors", pf1))
     f.write(carray("pf2_colors", pf2))
     f.write(carray("sun_colors", sunc))
     f.write(carray("sky_colors", sky4))
+with open(os.path.join(HDRDIR, "assets.i"), "w") as f:
+    f.write("; generated by tools/build_assets.py -- do not edit\n")
+    for k, v in consts:
+        f.write("%-16s equ %d\n" % (k, v))
 
 # ---------------------------------------------------------------- preview
 os.makedirs(PREVDIR, exist_ok=True)
@@ -271,6 +362,12 @@ def render(mid_px, fg_px):
         rows = img[TITLE_H + y0:TITLE_H + H]
         m = win > 0
         rows[m] = P[win[m]]
+    # title text (the visible window starts 16 bitmap pixels in)
+    tp = np.array(pf1[text_pen]) * 17
+    for y in range(TITLE_H):
+        for x in range(W):
+            if text_mask[y, x + 16]:
+                img[y, x] = tp
     return Image.fromarray(img, "RGB")
 
 

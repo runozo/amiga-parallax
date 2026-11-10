@@ -1,6 +1,7 @@
 # Build outputs
 /build/
 /src/assets.h
+/src/assets.i
 /src/*.o
 /src/parallax
 

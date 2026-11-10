@@ -1,6 +1,10 @@
 /*
  * Parallax scrolling demo for the Amiga 1200 (AGA)
  *
+ * Historical C implementation.  The demo is now written in 68k assembly
+ * (src/parallax.s); this file is kept for reference only and is no longer
+ * part of the build.
+ *
  *   sky        per-line COLOR00 gradient written by the copper
  *   sun        three hardware sprites, behind both playfields
  *   PF2        midground ruins, 4 bitplanes, 0.5 px/frame

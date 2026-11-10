@@ -1,4 +1,4 @@
-# Parallax Scrolling Demo — Amiga 1200 (AGA)
+# Parallax Scrolling Demo — Amiga 1200 (AGA), pure 68k assembly
 
 A parallax scrolling demo for AGA Amigas running **locked at 50 fps**:
 hardware-scrolled dual playfield, a copper sky, a sprite sun and the blitter
@@ -6,6 +6,12 @@ streaming new columns into the scrolling buffers. It uses the war-torn
 background art from
 `craftpix-771800-free-war-pixel-art-2d-game-backgrounds.zip`
 (the **War1 / Bright** layer set: sky, sun, ruins, houses, road, fence, craters).
+
+The demo is written entirely in 68020 assembly (vasm). Every asset is
+**embedded in the executable**; there is no data file, no file loading and no
+Intuition screen. The only library opened is `graphics.library`, for
+`WaitTOF()`, `LoadView()` and blitter ownership; everything else talks to the
+custom chips directly.
 
 ![demo](docs/screenshot.png)
 
@@ -22,9 +28,16 @@ background art from
 * Scroll steps are AGA **quarter pixels**, and the loop is locked to the
   vertical blank: every frame moves exactly the same distance.
 
+The title band is a 4-plane bitmap baked by the asset generator with a small
+8×8 font, so no font or `Text()` call is needed at run time.
+
 ## Controls
 
-* **ESC**, the **left mouse button** or **CTRL-C** — quit and return to the OS.
+* **left or right mouse button** — quit
+* **CTRL-C** — quit (also works from the DevBench bridge)
+
+On a bootable floppy/hard-disk image there is no Workbench, so quitting drops
+back to the boot CLI (or the insert-disk screen).
 
 ## Build
 
@@ -33,28 +46,31 @@ From the repository root:
 ```sh
 make adf       # build build/parallax-demo.adf (default target)
 make hdf       # build build/parallax-demo.hdf
+make parallax  # just assemble build/parallax
 ```
 
 `make` extracts the supplied zip into `assets/` (once), regenerates the planar
-assets and `src/assets.h`, cross-compiles the demo in the
-`amigadev/crosstools:m68k-amigaos` Docker image, and creates the bootable image
-with amitools.
+assets and `src/assets.i`, assembles `src/parallax.s` with vasm in the
+`amigadev/crosstools:m68k-amigaos` Docker image, and creates the bootable
+image with amitools.
 
-Requirements: Docker, `python3` + Pillow, `unzip`, and amitools
+Requirements: Docker, `python3` + Pillow + numpy, `unzip`, and amitools
 (`xdftool`/`rdbtool`). If amitools is installed in a virtualenv:
 
 ```sh
 make adf AMITOOLS_PY=/path/to/python-with-amitools
 ```
 
-The direct cross-compile is still available:
+The direct assembly is still available (the repository root must be mounted so
+that `build/` is visible):
 
 ```sh
-docker run --rm -v "$PWD/src:/work" -w /work \
-    amigadev/crosstools:m68k-amigaos make
+docker run --rm -v "$PWD:/work" -w /work \
+    amigadev/crosstools:m68k-amigaos make -C src
 ```
 
-This produces `src/parallax` (an AmigaOS `-noixemul` executable).
+This produces `src/parallax` (a plain AmigaOS hunk executable). The demo needs
+an AGA machine: it checks `DENISEID` and exits on OCS/ECS.
 
 ## Assets
 
@@ -66,14 +82,24 @@ The PNG layers were extracted from the supplied zip into `assets/`.
    (median cut + k-means on the opaque pixels) and remaps each layer with
    Floyd–Steinberg dithering; transparent pixels are colour 0.
 3. Turns the sky into one 12-bit colour per scanline and the sun into three
-   3-colour sprites.
+   3-colour sprites, with the sprite control words already baked in.
 4. **Mirror-tiles** each layer (`[scene][mirror(scene)]`, period 640 px =
    40 words); row 0 of each strip is left empty on purpose (see below).
-5. Writes:
-   * `parallax.dat` — PF2 and PF1 planar strips and sun sprite data (80 KB)
-   * `palette.bin` — PF1, PF2 and sprite palettes (reference export)
-   * `src/assets.h` — layout constants, palettes and the sky gradient
-   * `preview/*.png` — what the hardware should display
+5. Renders the two title lines into a 4-plane bitmap using the built-in 8×8
+   font.
+6. Writes the files that the assembly source `incbin`s:
+
+   | file | contents |
+   |---|---|
+   | `build/layers.bin` | PF2 + PF1 planar strips (79,680 B) |
+   | `build/sprites.bin` | 3 sun sprites + null sprite, control words included |
+   | `build/text.bin` | 4-plane title bitmap (5,040 B) |
+   | `build/sky.bin` | 200 colour words (one per scene line) |
+   | `build/palette.bin` | PF1 / PF2 / sun palettes |
+   | `src/assets.i` | layout constants for the assembly source |
+
+   `build/parallax.dat` and `src/assets.h` are still produced for reference /
+   external tools, but the assembly build does not need them.
 
 Regenerate with:
 
@@ -81,30 +107,13 @@ Regenerate with:
 python3 tools/build_assets.py <output-dir>
 ```
 
-or simply:
-
-```sh
-make assets
-```
-
-which also extracts the supplied zip into `assets/` if it is missing.
-
-The build outputs live in `build/` (ignored by git):
-`parallax`, `parallax.dat`, `palette.bin`, `parallax-demo.adf` (880 KB
-bootable floppy) and `parallax-demo.hdf` (16 MB bootable RDB hard-disk image).
-The documentation screenshot is [`docs/screenshot.png`](docs/screenshot.png).
+or simply `make assets`.
 
 ## Run on the target
 
-Copy `parallax` and `parallax.dat` to `Work:parallax/` on the Amiga
-(the DevBench host share is mounted at `/tmp/opencode/amiga_hd`), then start
-`Work:parallax/parallax` from the AmigaBridge launch command or the boot
-startup. The program needs the data file at
-`Work:parallax/data/parallax.dat`; the palette is compiled into the executable.
-If the absolute path is unavailable, the loader also tries
-`parallax/data/parallax.dat` and `data/parallax.dat`, and it suppresses
-AmigaDOS "insert volume" requesters, so the executable can be run from any
-directory that contains the data tree.
+Copy `parallax` alone to the Amiga (the DevBench host share is mounted at
+`/tmp/opencode/amiga_hd`) and run it. No data file is needed — the 85 KB of
+planar data lives in the executable and is copied to chip RAM at startup.
 
 ## Bootable images
 
@@ -124,61 +133,77 @@ CD Work:
 parallax/parallax >NIL:
 ```
 
-The demo starts automatically; ESC or CTRL-C returns to the OS. The images
-were boot-tested with Amiberry using a Kickstart 3.1 A1200 ROM.
+The demo starts automatically; the left/right mouse button or CTRL-C returns
+to the CLI. The images were boot-tested with Amiberry using a Kickstart 3.1
+A1200 ROM.
 
-## How the scrolling works
+## How it works
 
 * **Why not redraw with the blitter?** Redrawing two full-width layers every
   frame needs ~64,000 blitter cycles, more than the chip bus can give in one
-  PAL frame with the display on: that design tops out around 25 fps, so it
-  stutters. The demo now uses the technique of real Amiga games.
-* **Dual playfield.** `BPLCON0 = $0611`: 8 bitplanes, dual playfield. PF1
-  (odd planes) is the foreground and PF2 (even planes, colours 16–31 via
-  `BPLCON3/PF2OF`) the midground. Each playfield has its own bitplane
-  pointers and its own delay in `BPLCON1`, so the two layers scroll
+  PAL frame with the display on. The demo uses the technique of real Amiga
+  games instead.
+* **Dual playfield.** `BPLCON0 = $0611`: 8 bitplanes (AGA BPU3), dual
+  playfield. PF1 (odd planes) is the foreground and PF2 (even planes, colours
+  16–31 via `BPLCON3/PF2OF`) the midground. Each playfield has its own
+  bitplane pointers and its own delay in `BPLCON1`, so the two layers scroll
   independently at zero CPU/blitter cost.
 * **Quarter-pixel fine scroll.** `DDFSTRT = $30` fetches one extra word and
   `BPLCON1` delays each playfield by 0–63 quarter pixels (AGA adds two
-  35 ns bits per playfield), while the bitplane pointer advances one word every
-  16 pixels.
+  35 ns bits per playfield), while the bitplane pointer advances one word
+  every 16 pixels.
 * **Sliding buffer + blitter column streaming.** Each playfield buffer has
   21 words per row and no modulo. When the start pointer advances by one
   word, the word that just left the screen on row *y+1* becomes the new
-  right-hand word of row *y*. The blitter (A→D, 1 word × all rows × 4 planes)
-  copies the next 16-pixel column from the mirror-tiled strip into exactly
-  that word, at a moment when it is not visible. That is at most one tiny
-  blit per layer per frame. The buffer has 32 KB of headroom per plane;
-  when it runs out (after ~1.5 h) the position jumps back by whole periods
-  and the window is rebuilt at the start of the buffer.
+  right-hand word of row *y*. The blitter (A→D, 1 word × all rows × 4
+  planes) copies the next 16-pixel column from the mirror-tiled strip into
+  exactly that word, during vertical blank. That is at most one tiny blit per
+  layer per 16/32 frames. Each buffer has 4 KB of headroom per plane; when it
+  runs out (every ~11 min for the foreground, ~21 min for the midground) the
+  position is reduced modulo one strip period and the 21-column window is
+  rebuilt. The jump preserves the visual phase, so it is invisible.
 * **Copper.** The copper list sets the AGA registers, both palettes, the
-  sprite pointers and one `COLOR00` per scanline (border blanking hides the
-  colour changes outside the window). Playfields above their layer read the
-  strip's empty first row with modulo −42; at the layer's first line the
-  copper switches the modulo to 0 and the playfield starts walking its
-  buffer. Two copper lists are double-buffered: the CPU patches the idle
-  one (pointers + `BPLCON1`) and swaps `COP1LC` once per frame.
-* **System friendly.** The OS keeps running: the demo opens a quiet screen
-  for input, uses `LoadView(NULL)` + its own copper list, owns the blitter
-  only for the column blits, and restores the system view on exit.
+  sprite pointers, one `COLOR00` per scanline, and the playfield pointer
+  patches. Playfields above their layer read a fixed empty row with
+  modulo −42; at the layer's first line the copper switches the modulo to 0
+  and the pointers to the scrolling buffer. Two copper lists are
+  double-buffered: the CPU patches the idle one (17 words) and swaps
+  `COP1LC` once per frame.
+* **Fixed transparent rows.** The previous C version pointed the “empty”
+  part of each playfield at `base + w·2 − 42`, which walks into real image
+  data after a while; the assembly version uses a fixed empty row (the
+  64-byte guard before each buffer), so the title band and the sky above each
+  layer stay clean forever.
+* **Memory.** One `AllocMem(MEMF_CHIP|MEMF_CLEAR)` block of 164,856 bytes:
+  strips (79,680), PF2 buffer (4×11,512), PF1 buffer (4×7,352), title
+  (5,040), sprites (584) and two 2,048-byte copper lists.
+* **OS friendliness.** The OS keeps running: `LoadView(NULL)` detaches the
+  system view while the demo owns `COP1LC`; the blitter is owned only around
+  the column blits; `LoadView(oldview)` restores the display and
+  `DisownBlitter`/`FreeMem`/`CloseLibrary` release everything on exit.
 
 ## Performance
 
-Measured on the emulated A1200 with `parallax stats` (frames shown vs.
-50 Hz `DateStamp` ticks): **1329 frames in 1331 ticks**, i.e. a locked
-**50 fps**. A capture of the emulator display matched the expected rendering
-pixel for pixel, before and after a buffer rebase (`parallax rebase` starts
-next to the end of the buffer to test it).
+The main loop waits for the 50 Hz vertical blank with `WaitTOF()`. Per frame
+it only:
 
-For perfectly smooth motion in an emulator, run it at 50 Hz with VSync (or
-WinUAE/FS-UAE's "low latency vsync" mode); a 60 Hz host display without
-VSync adds judder of its own.
+1. advances the two quarter-pixel positions,
+2. computes `BPLCON1`,
+3. patches 17 copper words,
+4. swaps `COP1LC`.
+
+That is a few hundred cycles; the only real work is four tiny blits every
+16 or 32 frames (one word per row). The demo is therefore VBL-locked at
+50 fps with a large margin, and the CPU spends almost all of its time in
+`WaitTOF()`.
 
 ## Limitations / notes
 
 * The source art is a single 1920×1080 scene; the layers are **mirror-tiled**
   (period 640 px, i.e. two screen widths) to obtain seamless horizontal
   wrapping.
-* 15 colours per playfield with dithering; the original art has thousands
-  of colours.
+* 15 colours per playfield with dithering; the original art has thousands of
+  colours.
 * Requires AGA (the demo checks for Lisa and exits on OCS/ECS).
+* The title band uses the demo's own 8×8 pixel font (the C version used the
+  ROM Topaz font via `Text()`).
