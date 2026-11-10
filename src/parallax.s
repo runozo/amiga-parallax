@@ -3,19 +3,21 @@
 ;
 ; Pure 68k assembly rewrite of the C demo.  The hardware does the scrolling:
 ;
-;   * AGA dual playfield: PF1 (foreground) and PF2 (midground), 4 bitplanes
-;     each, independent bitplane pointers and BPLCON1 quarter-pixel delays.
-;   * Each playfield is a "sliding" bitmap: rows are packed with no modulo,
-;     so advancing the display pointer by one word needs exactly one new
-;     word per row.  The blitter streams the next 16-pixel column from the
+;   * AGA dual playfield, three scrolling layers.  PF1 carries the far layer
+;     above FG_Y0 and the foreground below it; PF2 carries the midground.
+;     BPLCON2's PF2PRI bit swaps which of the two is in front at FG_Y0.
+;   * Each layer is a "sliding" bitmap: rows are packed with no modulo, so
+;     advancing the display pointer by one word needs exactly one new word
+;     per row.  The blitter streams the next 16-pixel column from the
 ;     mirror-tiled layer strip during vertical blank.
-;   * Copper: per-line COLOR00 sky gradient, palettes, sprite pointers and
-;     the per-frame playfield patches.  Two copper lists are double buffered.
-;   * Sun: three hardware sprites behind both playfields.
+;   * Copper: per-line COLOR00 sky gradient, palettes, sprite pointers, the
+;     BPLCON2 priority swap and the per-frame playfield patches.  Two copper
+;     lists are double buffered.
+;   * Sun: three hardware sprites behind all playfields.
 ;
-; Per frame the CPU only advances two quarter-pixel positions, patches 17
-; copper words and (every 16/32 frames) starts four tiny blits.  Everything
-; else runs on the custom chips.
+; Per frame the CPU only advances three quarter-pixel positions, patches 26
+; copper words and (every 16/32/64 frames) starts four tiny blits.
+; Everything else runs on the custom chips.
 ;
 ; What was removed with respect to the C version:
 ;   * no Intuition screen/window, no DOS, no font/Text(), no runtime file
@@ -95,18 +97,23 @@ TEXT_ROWS       equ     TITLE_H+2       ; text rows plus two blank rows
 TEXT_PLANE      equ     TEXT_ROWS*ROWB  ; bytes per text bitplane
 TEXT_SIZE       equ     DEPTH*TEXT_PLANE ; four text bitplanes
 
+STRIP_FAR_SIZE  equ     DEPTH*FAR_H*STRIP_BYTES ; far strip image size
 STRIP_MID_SIZE  equ     DEPTH*MID_H*STRIP_BYTES ; mid strip image size
 STRIP_FG_SIZE   equ     DEPTH*FG_H*STRIP_BYTES  ; foreground strip image size
+FAR_MEM         equ     GUARD+(FAR_H+1)*ROWB+EXTRA ; far buffer incl. extra row
+FAR_SIZE        equ     (FAR_MEM+7)&~7  ; far plane stride, longword aligned
 MID_MEM         equ     GUARD+(MID_H+1)*ROWB+EXTRA ; mid buffer incl. extra row
 MID_SIZE        equ     (MID_MEM+7)&~7  ; mid plane stride, longword aligned
 FG_MEM          equ     GUARD+(FG_H+1)*ROWB+EXTRA  ; fg buffer incl. extra row
 FG_SIZE         equ     (FG_MEM+7)&~7   ; fg plane stride, longword aligned
 SPR_SIZE        equ     584             ; 8 sprite structs of 73 bytes
-COP_LIST        equ     2048            ; bytes per copper list (1024 words)
+COP_LIST        equ     3072            ; bytes per copper list (1536 words)
 
-CHIP_SMID       equ     0               ; mid strip image in chip RAM
+CHIP_SFAR       equ     0               ; far strip image in chip RAM
+CHIP_SMID       equ     CHIP_SFAR+STRIP_FAR_SIZE ; mid strip image
 CHIP_SFG        equ     CHIP_SMID+STRIP_MID_SIZE ; fg strip image
-CHIP_MID        equ     CHIP_SFG+STRIP_FG_SIZE   ; four mid plane buffers
+CHIP_FAR        equ     CHIP_SFG+STRIP_FG_SIZE   ; four far plane buffers
+CHIP_MID        equ     CHIP_FAR+4*FAR_SIZE      ; four mid plane buffers
 CHIP_FG         equ     CHIP_MID+4*MID_SIZE      ; four fg plane buffers
 CHIP_TEXT       equ     CHIP_FG+4*FG_SIZE        ; four text bitplanes
 CHIP_SPR        equ     CHIP_TEXT+TEXT_SIZE      ; sprite images
@@ -205,13 +212,19 @@ start:                                  ; program entry point
 ; ---- copy the incbin'd assets into chip RAM ------------------------------
         move.l  chipblock,d7            ; d7 = chip block base (kept below)
 
-        lea     asset_layers,a0         ; source: midground strip image
+        lea     asset_layers,a0         ; source: far strip image
+        move.l  d7,a1                   ; destination: chip RAM
+        add.l   #CHIP_SFAR,a1           ; at the far strip offset
+        move.l  #STRIP_FAR_SIZE/4-1,d0  ; longword count minus one
+        bsr     copy_longs              ; copy it
+
+        lea     asset_layers+STRIP_FAR_SIZE,a0 ; source: midground strip
         move.l  d7,a1                   ; destination: chip RAM
         add.l   #CHIP_SMID,a1           ; at the mid strip offset
         move.l  #STRIP_MID_SIZE/4-1,d0  ; longword count minus one
         bsr     copy_longs              ; copy it
 
-        lea     asset_layers+STRIP_MID_SIZE,a0 ; source: foreground strip
+        lea     asset_layers+STRIP_FAR_SIZE+STRIP_MID_SIZE,a0 ; source: foreground
         move.l  d7,a1                   ; destination: chip RAM
         add.l   #CHIP_SFG,a1            ; at the fg strip offset
         move.l  #STRIP_FG_SIZE/4-1,d0   ; longword count minus one
@@ -230,6 +243,15 @@ start:                                  ; program entry point
         bsr     copy_longs              ; copy it
 
 ; ---- point the layer descriptors at the chip block -----------------------
+        lea     far_layer,a1            ; a1 = far Layer struct
+        move.l  d7,d0                   ; chip block base
+        add.l   #CHIP_SFAR,d0           ; -> far strip image
+        move.l  d0,L_STRIP(a1)          ; L_STRIP = strip address
+        move.l  d7,d0                   ; chip block base
+        add.l   #CHIP_FAR+GUARD,d0      ; -> far plane 0 after the guard
+        move.l  d0,L_BASE(a1)           ; L_BASE = plane 0 base
+        move.l  d0,far_base             ; keep the base for copper patching
+
         lea     mid_layer,a1            ; a1 = midground Layer struct
         move.l  d7,d0                   ; chip block base
         add.l   #CHIP_SMID,d0           ; -> mid strip image
@@ -275,6 +297,10 @@ start:                                  ; program entry point
         bsr     build_list              ; build list1
 
 ; ---- first frame: stream the initial columns, patch both lists ----------
+        lea     far_layer,a2            ; a2 = far layer
+        bsr     layer_frame             ; stream its first columns
+        move.l  d0,wfar                 ; wfar = first fetched word
+        move.w  d1,dfar                 ; dfar = far scroll delay
         lea     mid_layer,a2            ; a2 = midground layer
         bsr     layer_frame             ; stream its first columns
         move.l  d0,wm                   ; wm = first fetched word
@@ -283,7 +309,15 @@ start:                                  ; program entry point
         bsr     layer_frame             ; stream its first columns
         move.l  d0,wf                   ; wf = first fetched word
         move.w  d1,df                   ; df = fg scroll delay
-        bsr     make_con1               ; combine delays into BPLCON1
+
+        move.w  dfar,d0                 ; above FG_Y0: PF1 = far
+        move.w  dm,d1                   ;                PF2 = mid
+        bsr     make_con1               ; build the upper BPLCON1 word
+        move.w  d2,con1_top             ; keep it for patching
+        move.w  df,d0                   ; below FG_Y0: PF1 = foreground
+        move.w  dm,d1                   ;                PF2 = mid
+        bsr     make_con1               ; build the lower BPLCON1 word
+        move.w  d2,con1_bot             ; keep it for patching
 
         moveq   #0,d0                   ; patch-table index 0
         movea.l d0,a4                   ; a4 = byte offset 0
@@ -328,6 +362,10 @@ main_loop:                              ; one iteration per frame
         and.l   #SIGBREAKF_CTRL_C,d0    ; CTRL-C bit set?
         bne     exit                    ; yes -> quit
 
+        lea     far_layer,a2            ; a2 = far layer
+        bsr     layer_frame             ; advance and refill the far layer
+        move.l  d0,wfar                 ; wfar = first fetched word
+        move.w  d1,dfar                 ; dfar = far scroll delay
         lea     mid_layer,a2            ; a2 = midground layer
         bsr     layer_frame             ; advance and refill midground
         move.l  d0,wm                   ; wm = first fetched word
@@ -336,7 +374,15 @@ main_loop:                              ; one iteration per frame
         bsr     layer_frame             ; advance and refill foreground
         move.l  d0,wf                   ; wf = first fetched word
         move.w  d1,df                   ; df = fg scroll delay
-        bsr     make_con1               ; update the BPLCON1 word
+
+        move.w  dfar,d0                 ; above FG_Y0: PF1 = far
+        move.w  dm,d1                   ;                PF2 = mid
+        bsr     make_con1               ; build the upper BPLCON1 word
+        move.w  d2,con1_top             ; keep it for patching
+        move.w  df,d0                   ; below FG_Y0: PF1 = foreground
+        move.w  dm,d1                   ;                PF2 = mid
+        bsr     make_con1               ; build the lower BPLCON1 word
+        move.w  d2,con1_bot             ; keep it for patching
 
         moveq   #0,d0                   ; patch the idle list
         move.w  cur,d0                  ; d0 = list currently displayed
@@ -504,36 +550,33 @@ fill_column:                            ; stream one 16-pixel column
         rts                             ; column complete
 
 ; ===========================================================================
-; make_con1: dm/df variables -> con1 word (also in d0)
+; make_con1: d0.w = PF1 delay, d1.w = PF2 delay -> d2.w = BPLCON1 word
 ;   bits 0-3 PF1 coarse, 4-7 PF2 coarse, 8-9 PF1 fine, 12-13 PF2 fine
 ; ===========================================================================
 make_con1:                              ; build the BPLCON1 word
-        move.w  dm,d6                   ; d6 = midground delay
-        move.w  df,d5                   ; d5 = foreground delay
-        move.w  d6,d0                   ; d0 = midground delay
-        lsr.w   #2,d0                   ; coarse = delay / 4
-        move.w  d5,d1                   ; d1 = foreground delay
-        lsr.w   #2,d1                   ; coarse = delay / 4
-        lsl.w   #4,d0                   ; PF2 coarse -> bits 4-7
-        or.w    d1,d0                   ; PF1 coarse -> bits 0-3
-        move.w  d6,d1                   ; d1 = midground delay
-        and.w   #3,d1                   ; fine = delay & 3
-        lsl.w   #4,d1                   ; fine into bits 4-5...
-        lsl.w   #8,d1                   ; ...then bits 12-13
-        or.w    d1,d0                   ; PF2 fine -> bits 12-13
-        move.w  d5,d1                   ; d1 = foreground delay
-        and.w   #3,d1                   ; fine = delay & 3
-        lsl.w   #8,d1                   ; fine into bits 8-9
-        or.w    d1,d0                   ; PF1 fine -> bits 8-9
-        move.w  d0,con1                 ; keep the value for patching
-        rts                             ; return it in d0 as well
+        move.w  d0,d2                   ; d2 = PF1 delay
+        lsr.w   #2,d2                   ; PF1 coarse = delay / 4
+        move.w  d1,d3                   ; d3 = PF2 delay
+        lsr.w   #2,d3                   ; PF2 coarse = delay / 4
+        lsl.w   #4,d3                   ; PF2 coarse -> bits 4-7
+        or.w    d3,d2                   ; PF1 coarse -> bits 0-3
+        move.w  d0,d3                   ; d3 = PF1 delay
+        and.w   #3,d3                   ; PF1 fine = delay & 3
+        lsl.w   #8,d3                   ; fine into bits 8-9
+        or.w    d3,d2                   ; PF1 fine -> bits 8-9
+        move.w  d1,d3                   ; d3 = PF2 delay
+        and.w   #3,d3                   ; PF2 fine = delay & 3
+        lsl.w   #4,d3                   ; into bits 4-5...
+        lsl.w   #8,d3                   ; ...then bits 12-13
+        or.w    d3,d2                   ; PF2 fine -> bits 12-13
+        rts                             ; result in d2
 
 ; ===========================================================================
 ; build_list: a3 = destination, a4 = patch-table byte index (0 or 4)
 ; ===========================================================================
 build_list:                             ; emit a complete copper list
         COPMOVE BPLCON0,BPLCON0_VAL     ; 8 planes, dual playfield, ECSENA
-        COPMOVE BPLCON2,$0000           ; no playfield priority overrides
+        COPMOVE BPLCON2,$0040           ; PF2 in front: mid over the far layer
         COPMOVE BPLCON3,BPLCON3_VAL     ; PF2 colours at 16, border blank
         COPMOVE BPLCON4,$0022           ; no palette bank or bitplane XOR
         COPMOVE FMODE,$0000             ; slowest/safest AGA fetch mode
@@ -629,27 +672,24 @@ build_list:                             ; emit a complete copper list
 
         tst.w   d7                      ; first scene line?
         bne.s   .not_y0                 ; no -> skip the one-time setup
-; PF1 stops showing the text; show a guaranteed empty row until FG_Y0
-        COPMOVE BPL1MOD,-ROWB           ; PF1 steps back one row per line
+; PF1 stops showing the text and displays the far layer until FG_Y0
         move.w  #BPLCON1,(a3)+          ; BPLCON1 register
-        lea     patch_con1,a5           ; remember where to patch it
+        lea     patch_con1_top,a5       ; remember where to patch it
         move.l  a3,(a5,a4.w)            ; store the address for this list
-        move.w  #0,(a3)+                ; placeholder value
-
-        move.l  fg_base,a0              ; a0 = fg plane 0
-        sub.l   #ROWB,a0                ; one row above = empty guard row
+        move.w  #0,(a3)+                ; placeholder: far/mid delays
+        lea     patch_far,a5            ; remember the far pointer block
+        move.l  a3,(a5,a4.w)            ; store the address for this list
         move.w  #BPL1PTH,d5             ; PF1 pointer registers
         moveq   #3,d2                   ; four planes
-.fgabove:                               ; empty PF1 row above the scene
-        COPPTR  a0,FG_SIZE              ; point PF1 at the empty row
-        dbra    d2,.fgabove             ; loop over the four planes
+.farptr:                                ; far pointer placeholder
+        COPSLOT                         ; zero placeholder, patched per frame
+        dbra    d2,.farptr              ; loop over the four planes
 .not_y0:                                ; past the first scene line
         cmp.w   #MID_Y0,d7              ; midground starts here?
         bne.s   .not_mid                ; no -> skip
         COPMOVE BPL2MOD,0               ; PF2 rows are now contiguous
         lea     patch_pf2,a5            ; remember the PF2 pointer block
         move.l  a3,(a5,a4.w)            ; store the address for this list
-        move.l  mid_base,a0             ; a0 = mid plane 0
         move.w  #BPL1PTH+4,d5           ; PF2 pointer registers
         moveq   #3,d2                   ; four planes
 .midptr:                                ; midground pointer placeholder
@@ -658,10 +698,13 @@ build_list:                             ; emit a complete copper list
 .not_mid:                               ; not the midground start line
         cmp.w   #FG_Y0,d7               ; foreground starts here?
         bne.s   .not_fg                 ; no -> skip
-        COPMOVE BPL1MOD,0               ; PF1 rows are now contiguous
+        COPMOVE BPLCON2,$0000           ; PF1 back in front: fg over mid
+        move.w  #BPLCON1,(a3)+          ; BPLCON1 register
+        lea     patch_con1_bot,a5       ; remember where to patch it
+        move.l  a3,(a5,a4.w)            ; store the address for this list
+        move.w  #0,(a3)+                ; placeholder: fg/mid delays
         lea     patch_pf1,a5            ; remember the PF1 pointer block
         move.l  a3,(a5,a4.w)            ; store the address for this list
-        move.l  fg_base,a0              ; a0 = fg plane 0
         move.w  #BPL1PTH,d5             ; PF1 pointer registers
         moveq   #3,d2                   ; four planes
 .fgptr:                                 ; foreground pointer placeholder
@@ -678,9 +721,16 @@ build_list:                             ; emit a complete copper list
         rts                             ; list complete
 
 ; ===========================================================================
-; patch_list: a4 = patch-table byte index; uses wm/wf/con1
+; patch_list: a4 = patch-table byte index; uses wfar/wm/wf/con1_top/con1_bot
 ; ===========================================================================
 patch_list:                             ; patch the per-frame copper values
+        lea     patch_far,a0            ; far pointer-table entry
+        move.l  (a0,a4.w),a1            ; -> far pointer block in this list
+        move.l  far_base,a0             ; far plane 0 base
+        move.l  wfar,d0                 ; first fetched far word
+        move.l  #FAR_SIZE,d1            ; far plane stride
+        bsr     patch_ptr               ; patch the four far pointers
+
         lea     patch_pf2,a0            ; PF2 pointer-table entry
         move.l  (a0,a4.w),a1            ; -> PF2 pointer block in this list
         move.l  mid_base,a0             ; mid plane 0 base
@@ -695,9 +745,12 @@ patch_list:                             ; patch the per-frame copper values
         move.l  #FG_SIZE,d1             ; fg plane stride
         bsr     patch_ptr               ; patch the four PF1 pointers
 
-        lea     patch_con1,a0           ; BPLCON1 patch-table entry
-        move.l  (a0,a4.w),a1            ; -> BPLCON1 value word in this list
-        move.w  con1,(a1)               ; store the combined scroll delays
+        lea     patch_con1_top,a0       ; upper BPLCON1 patch-table entry
+        move.l  (a0,a4.w),a1            ; -> upper BPLCON1 value word
+        move.w  con1_top,(a1)           ; far (PF1) + mid (PF2) delays
+        lea     patch_con1_bot,a0       ; lower BPLCON1 patch-table entry
+        move.l  (a0,a4.w),a1            ; -> lower BPLCON1 value word
+        move.w  con1_bot,(a1)           ; fg (PF1) + mid (PF2) delays
         rts                             ; list patched
 
 ; ===========================================================================
@@ -735,6 +788,7 @@ oldview:        dc.l    0               ; saved OS view
 dma_clear:      dc.w    0               ; DMACON bits to clear on exit
         cnop    0,4                     ; align the next block
 
+far_base:       dc.l    0               ; far plane 0 base
 mid_base:       dc.l    0               ; mid plane 0 base
 fg_base:        dc.l    0               ; fg plane 0 base
 text_base:      dc.l    0               ; text plane 0 base
@@ -742,18 +796,33 @@ spr_base:       dc.l    0               ; sprite image base
 list0:          dc.l    0               ; first copper list
 list1:          dc.l    0               ; second copper list
 list_ptrs:      dc.l    0,0             ; double-buffer table
+patch_far:      dc.l    0,0             ; far patch address per list
 patch_pf1:      dc.l    0,0             ; PF1 patch address per list
 patch_pf2:      dc.l    0,0             ; PF2 patch address per list
-patch_con1:     dc.l    0,0             ; BPLCON1 patch address per list
+patch_con1_top: dc.l    0,0             ; upper BPLCON1 address per list
+patch_con1_bot: dc.l    0,0             ; lower BPLCON1 address per list
 
 cur:            dc.w    0               ; copper list currently displayed
 next:           dc.w    0               ; copper list being patched
 dm:             dc.w    0               ; midground scroll delay
 df:             dc.w    0               ; foreground scroll delay
+dfar:           dc.w    0               ; far scroll delay
 wm:             dc.l    0               ; midground first fetched word
 wf:             dc.l    0               ; foreground first fetched word
-con1:           dc.w    0               ; combined BPLCON1 value
+wfar:           dc.l    0               ; far first fetched word
+con1_top:       dc.w    0               ; upper BPLCON1 value
+con1_bot:       dc.w    0               ; lower BPLCON1 value
         cnop    0,4                     ; align the layer descriptors
+
+far_layer:                              ; far layer descriptor
+        dc.l    0                      ; strip (set at run time)
+        dc.l    0                      ; base
+        dc.l    0                      ; pos
+        dc.l    -1                     ; filled
+        dc.w    FAR_H                  ; height
+        dc.w    FAR_SPEED              ; speed
+        dc.l    FAR_SIZE               ; plane stride in the buffer
+        dc.l    FAR_H*STRIP_BYTES      ; plane stride in the strip
 
 mid_layer:                              ; midground layer descriptor
         dc.l    0                      ; strip (set at run time)
@@ -778,7 +847,7 @@ fg_layer:                               ; foreground layer descriptor
 ; ---- generated assets ---------------------------------------------------
 palette:        incbin  "palette.bin"   ; 32 AGA colour words
 sky:            incbin  "sky.bin"       ; one background colour per scene line
-asset_layers:   incbin  "layers.bin"    ; mirrored mid/fg planar strips
+asset_layers:   incbin  "layers.bin"    ; mirrored far/mid/fg planar strips
 asset_sprites:  incbin  "sprites.bin"   ; hardware sprite images
 asset_text:     incbin  "text.bin"      ; title text bitplanes
 

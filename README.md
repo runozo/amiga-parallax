@@ -21,12 +21,20 @@ custom chips directly.
 * **Sky** — one colour per scanline, written to `COLOR00` by the copper.
 * **Sun** — three 16-pixel hardware sprites placed *behind* both playfields,
   so its glow disappears behind the ruins.
-* **Midground** (ruins + house3 + houses2) — playfield 2, 4 bitplanes,
+* **Far background** (ruins) — playfield 1 above the foreground, 4 bitplanes,
+  4 colours, scrolling at **0.25 px/frame** (12.5 px/s).
+* **Midground** (house3 + houses2) — playfield 2, 4 bitplanes,
   15 colours, scrolling at **0.5 px/frame** (25 px/s).
 * **Foreground** (houses1 + fence + road + craters) — playfield 1, 4
-  bitplanes, 15 colours, scrolling at **1 px/frame** (50 px/s).
+  bitplanes, 11 colours, scrolling at **1 px/frame** (50 px/s).
 * Scroll steps are AGA **quarter pixels**, and the loop is locked to the
   vertical blank: every frame moves exactly the same distance.
+
+The three layers are real, independently moving parallax layers. The far
+layer shares PF1 with the foreground, but the two never occupy the same
+scanlines: above `FG_Y0` PF1 shows the far layer and PF2 (midground) has
+priority over it (`BPLCON2` bit 6); at `FG_Y0` PF1 switches to the foreground
+and priority returns to normal.
 
 The title band is a 4-plane bitmap baked by the asset generator with a small
 8×8 font, so no font or `Text()` call is needed at run time.
@@ -78,9 +86,11 @@ The PNG layers were extracted from the supplied zip into `assets/`.
 [`tools/build_assets.py`](tools/build_assets.py) performs the conversion:
 
 1. Loads `assets/PNG/War1/Bright/*.png` and scales the layers to 320×200.
-2. Builds a separate **15-colour, 12-bit palette** for each playfield
-   (median cut + k-means on the opaque pixels) and remaps each layer with
-   Floyd–Steinberg dithering; transparent pixels are colour 0.
+2. Builds a 12-bit palette for each playfield (median cut + k-means on the
+   opaque pixels) and remaps each layer with Floyd–Steinberg dithering;
+   transparent pixels are colour 0. PF1's 15 colours are partitioned:
+   entries 1–11 for the foreground, 12–15 for the far layer. PF2 keeps its
+   own 15 colours for the midground.
 3. Turns the sky into one 12-bit colour per scanline and the sun into three
    3-colour sprites, with the sprite control words already baked in.
 4. **Mirror-tiles** each layer (`[scene][mirror(scene)]`, period 640 px =
@@ -91,7 +101,7 @@ The PNG layers were extracted from the supplied zip into `assets/`.
 
    | file | contents |
    |---|---|
-   | `build/layers.bin` | PF2 + PF1 planar strips (79,680 B) |
+   | `build/layers.bin` | far + PF2 + PF1 planar strips (119,680 B) |
    | `build/sprites.bin` | 3 sun sprites + null sprite, control words included |
    | `build/text.bin` | 4-plane title bitmap (5,040 B) |
    | `build/sky.bin` | 200 colour words (one per scene line) |
@@ -112,7 +122,7 @@ or simply `make assets`.
 ## Run on the target
 
 Copy `parallax` alone to the Amiga (the DevBench host share is mounted at
-`/tmp/opencode/amiga_hd`) and run it. No data file is needed — the 85 KB of
+`/tmp/opencode/amiga_hd`) and run it. No data file is needed — the 120 KB of
 planar data lives in the executable and is copied to chip RAM at startup.
 
 ## Bootable images
@@ -130,7 +140,7 @@ Both images boot `S/startup-sequence`, which does:
 
 ```
 CD Work:
-parallax/parallax >NIL:
+parallax >NIL:
 ```
 
 The demo starts automatically; the left/right mouse button or CTRL-C returns
@@ -139,15 +149,19 @@ A1200 ROM.
 
 ## How it works
 
-* **Why not redraw with the blitter?** Redrawing two full-width layers every
-  frame needs ~64,000 blitter cycles, more than the chip bus can give in one
-  PAL frame with the display on. The demo uses the technique of real Amiga
-  games instead.
-* **Dual playfield.** `BPLCON0 = $0611`: 8 bitplanes (AGA BPU3), dual
-  playfield. PF1 (odd planes) is the foreground and PF2 (even planes, colours
-  16–31 via `BPLCON3/PF2OF`) the midground. Each playfield has its own
-  bitplane pointers and its own delay in `BPLCON1`, so the two layers scroll
-  independently at zero CPU/blitter cost.
+* **Why not redraw with the blitter?** Redrawing the full-width layers every
+  frame needs tens of thousands of blitter cycles, more than the chip bus can
+  give in one PAL frame with the display on. The demo uses the technique of
+  real Amiga games instead.
+* **Dual playfield, three layers.** `BPLCON0 = $0611`: 8 bitplanes (AGA BPU3),
+  dual playfield. PF1 (odd planes) carries the far layer above `FG_Y0` and
+  the foreground below it; PF2 (even planes, colours 16–31 via
+  `BPLCON3/PF2OF`) carries the midground. Above `FG_Y0` the copper sets
+  `BPLCON2` bit 6 (`PF2PRI`) so the midground is in front of the far layer;
+  at `FG_Y0` it clears the bit so the foreground is in front of the
+  midground. Each playfield still has one pointer group and one `BPLCON1`
+  delay, and the copper switches PF1's delay together with its pointers, so
+  all three layers scroll independently.
 * **Quarter-pixel fine scroll.** `DDFSTRT = $30` fetches one extra word and
   `BPLCON1` delays each playfield by 0–63 quarter pixels (AGA adds two
   35 ns bits per playfield), while the bitplane pointer advances one word
@@ -158,25 +172,27 @@ A1200 ROM.
   right-hand word of row *y*. The blitter (A→D, 1 word × all rows × 4
   planes) copies the next 16-pixel column from the mirror-tiled strip into
   exactly that word, during vertical blank. That is at most one tiny blit per
-  layer per 16/32 frames. Each buffer has 4 KB of headroom per plane; when it
-  runs out (every ~11 min for the foreground, ~21 min for the midground) the
-  position is reduced modulo one strip period and the 21-column window is
-  rebuilt. The jump preserves the visual phase, so it is invisible.
+  layer per 16/32/64 frames. Each buffer has 4 KB of headroom per plane; when
+  it runs out (every ~11 min for the foreground, ~21 min for the midground,
+  ~43 min for the far layer) the position is reduced modulo one strip period
+  and the 21-column window is rebuilt. The jump preserves the visual phase,
+  so it is invisible.
 * **Copper.** The copper list sets the AGA registers, both palettes, the
   sprite pointers, one `COLOR00` per scanline, and the playfield pointer
-  patches. Playfields above their layer read a fixed empty row with
-  modulo −42; at the layer's first line the copper switches the modulo to 0
-  and the pointers to the scrolling buffer. Two copper lists are
-  double-buffered: the CPU patches the idle one (17 words) and swaps
-  `COP1LC` once per frame.
+  patches. Above `FG_Y0` PF1 shows the far layer and PF2 shows the empty row
+  until `MID_Y0`; at each layer's first line the copper switches the modulo
+  to 0 and the pointers to the scrolling buffer, and at `FG_Y0` it switches
+  PF1 to the foreground, changes `BPLCON1` and clears `PF2PRI`. Two copper
+  lists are double-buffered: the CPU patches the idle one (26 words) and
+  swaps `COP1LC` once per frame.
 * **Fixed transparent rows.** The previous C version pointed the “empty”
   part of each playfield at `base + w·2 − 42`, which walks into real image
   data after a while; the assembly version uses a fixed empty row (the
   64-byte guard before each buffer), so the title band and the sky above each
   layer stay clean forever.
-* **Memory.** One `AllocMem(MEMF_CHIP|MEMF_CLEAR)` block of 164,856 bytes:
-  strips (79,680), PF2 buffer (4×11,512), PF1 buffer (4×7,352), title
-  (5,040), sprites (584) and two 2,048-byte copper lists.
+* **Memory.** One `AllocMem(MEMF_CHIP|MEMF_CLEAR)` block of 244,728 bytes:
+  strips (119,680), far buffer (4×9,456), PF2 buffer (4×11,512), PF1 buffer
+  (4×7,352), title (5,040), sprites (584) and two 3,072-byte copper lists.
 * **OS friendliness.** The OS keeps running: `LoadView(NULL)` detaches the
   system view while the demo owns `COP1LC`; the blitter is owned only around
   the column blits; `LoadView(oldview)` restores the display and
@@ -187,23 +203,27 @@ A1200 ROM.
 The main loop waits for the 50 Hz vertical blank with `WaitTOF()`. Per frame
 it only:
 
-1. advances the two quarter-pixel positions,
-2. computes `BPLCON1`,
-3. patches 17 copper words,
+1. advances the three quarter-pixel positions,
+2. computes the two `BPLCON1` words,
+3. patches 26 copper words,
 4. swaps `COP1LC`.
 
 That is a few hundred cycles; the only real work is four tiny blits every
-16 or 32 frames (one word per row). The demo is therefore VBL-locked at
-50 fps with a large margin, and the CPU spends almost all of its time in
-`WaitTOF()`.
+16, 32 or 64 frames (one word per row). The far layer adds no bitplane DMA —
+its scanlines were already being fetched for the empty PF1 row — so the
+demo stays VBL-locked at 50 fps with a large margin, and the CPU spends
+almost all of its time in `WaitTOF()`.
 
 ## Limitations / notes
 
 * The source art is a single 1920×1080 scene; the layers are **mirror-tiled**
   (period 640 px, i.e. two screen widths) to obtain seamless horizontal
   wrapping.
-* 15 colours per playfield with dithering; the original art has thousands of
-  colours.
+* PF1's 15 colours are split between the foreground (11) and the far layer
+  (4); PF2 keeps 15 colours for the midground. The original art has thousands
+  of colours.
+* The far layer is only displayed above `FG_Y0`, where PF1 is not used by the
+  foreground; it is hidden behind the midground/foreground below that line.
 * Requires AGA (the demo checks for Lisa and exits on OCS/ECS).
 * The title band uses the demo's own 8×8 pixel font (the C version used the
   ROM Topaz font via `Text()`).

@@ -63,11 +63,10 @@ $(ADF): build/parallax
 	$(XDFTOOL) $@ format "Work" ffs
 	$(XDFTOOL) $@ boot install
 	$(XDFTOOL) $@ makedir S
-	$(XDFTOOL) $@ makedir parallax
-	$(XDFTOOL) $@ write build/parallax parallax/parallax
-	printf 'CD Work:\nparallax/parallax >NIL:\n' > $(STARTUP)
+	$(XDFTOOL) $@ write build/parallax parallax
+	printf 'CD Work:\nparallax >NIL:\n' > $(STARTUP)
 	$(XDFTOOL) $@ write $(STARTUP) S/startup-sequence
-	$(XDFTOOL) $@ protect parallax/parallax rwed
+	$(XDFTOOL) $@ protect parallax rwed
 	@echo "built: $@"
 
 # ---- bootable 16 MB RDB HDF --------------------------------------------
@@ -76,9 +75,9 @@ $(HDF): build/parallax
 	$(RDBTOOL) $@ create size=16M
 	$(RDBTOOL) $@ init
 	$(RDBTOOL) $@ add name=dh0 size=90% dostype=DOS3 bootable=1 pri=1
-	printf 'CD Work:\nparallax/parallax >NIL:\n' > $(STARTUP)
+	printf 'CD Work:\nparallax >NIL:\n' > $(STARTUP)
 	$(XDFTOOL) $(RAW) create chs=27,16,63
-	$(XDFTOOL) $(RAW) open chs=27,16,63 + format "Work" ffs + boot install + makedir S + makedir parallax + write build/parallax parallax/parallax + write $(STARTUP) S/startup-sequence + protect parallax/parallax rwed
+	$(XDFTOOL) $(RAW) open chs=27,16,63 + format "Work" ffs + boot install + makedir S + write build/parallax parallax + write $(STARTUP) S/startup-sequence + protect parallax rwed
 	$(RDBTOOL) $@ import dh0 $(RAW) pad
 	@echo "built: $@"
 

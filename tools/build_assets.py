@@ -7,8 +7,13 @@ Source: craftpix "War1 / Bright" layered background (1920x1080).
 Layers (scaled to a 320x200 scene):
   * sky       -> one 12-bit colour per scanline (copper COLOR00 gradient)
   * sun       -> three 16-pixel hardware sprites, 3 colours
-  * midground -> PF2, 4 bitplanes, 15 colours  (ruins + house3 + houses2)
-  * foreground-> PF1, 4 bitplanes, 15 colours  (houses1 + fence + road + craters)
+  * far       -> PF1, 4 bitplanes, 4 colours   (ruins, above FG_Y0)
+  * midground -> PF2, 4 bitplanes, 15 colours  (house3 + houses2)
+  * foreground-> PF1, 4 bitplanes, 11 colours  (houses1 + fence + road + craters)
+
+PF1's 15 colours are partitioned: entries 1..11 belong to the foreground,
+entries 12..15 to the far layer.  The copper switches PF1's bitmap at
+FG_Y0, so no palette reload is needed in the middle of a frame.
 
 Each playfield layer is mirror-tiled to a 640-pixel period (40 words) and
 stored as a planar strip; the demo streams 16-pixel columns out of it with
@@ -16,7 +21,7 @@ the blitter.  Row 0 of every strip is kept empty: the demo relies on it to
 show a transparent playfield above each layer.
 
 Outputs (in <outdir>):
-  layers.bin     mid + fg planar strips, ready to be incbin'd
+  layers.bin     far + mid + fg planar strips, ready to be incbin'd
   sprites.bin    final 3-sprite sun block + null sprite (control words baked)
   text.bin       4-plane title bitmap (rendered from the built-in 8x8 font)
   sky.bin        200 colour words, one per scene line
@@ -44,11 +49,14 @@ PERIOD_WORDS = 40          # mirror tile period: 640 px
 STRIP_BYTES = PERIOD_WORDS * 2
 MID_Y0 = 26                # first scene row of the PF2 strip (empty row)
 FG_Y0 = 125                # first scene row of the PF1 strip (empty row)
+FAR_Y0 = 0                 # far layer starts at the top of the scene
+FAR_H = FG_Y0 - FAR_Y0     # far layer rows (hidden below the foreground)
 MID_H = H - MID_Y0
 FG_H = H - FG_Y0
 SUN_D = 46                 # sun diameter in pixels
 SUN_X, SUN_Y = 56, 4       # sun position in the scene
 SUN_SPRITES = 3            # 3 x 16 px = 48 px wide
+FAR_SPEED = 1              # quarter pixels per frame (0.25 px)
 MID_SPEED = 2              # quarter pixels per frame (0.5 px)
 FG_SPEED = 4               # quarter pixels per frame (1 px)
 TEXT_ROWS = TITLE_H + 2
@@ -160,11 +168,20 @@ def dither(rgb, mask, pal4):
     return out
 
 
-def layer_indices(img):
+def layer_indices(img, n=15):
     arr = np.asarray(img)
     mask = arr[..., 3] > 128
-    pal = kmeans_palette(arr[..., :3][mask], 15)
+    pal = kmeans_palette(arr[..., :3][mask], n)
     return dither(arr[..., :3], mask, pal), pal
+
+
+def pad_pal(pal, n):
+    """Exactly n colour entries; duplicate the last one if quantisation
+    returned fewer unique colours, so pen offsets stay predictable."""
+    pal = list(pal)
+    while len(pal) < n:
+        pal.append(pal[-1] if pal else (0, 0, 0))
+    return pal[:n]
 
 
 def mirror_strip(idx, y0):
@@ -192,17 +209,27 @@ L = {n: load(n + ".png") for n in
      ["sky", "ruins", "house3", "houses2", "houses1", "fence", "road",
       "crater1", "crater2", "crater3"]}
 
-mid_img = over(L["ruins"], L["house3"], L["houses2"])
+far_img = L["ruins"].crop((0, FAR_Y0, W, FAR_Y0 + FAR_H))
+mid_img = over(L["house3"], L["houses2"])
 fg_img = over(L["houses1"], L["fence"], L["road"],
               L["crater1"], L["crater2"], L["crater3"])
 
+far_alpha = np.asarray(far_img)[..., 3] > 128
 mid_alpha = np.asarray(mid_img)[..., 3] > 128
 fg_alpha = np.asarray(fg_img)[..., 3] > 128
+assert far_alpha.any(), "far layer is empty"
 assert not mid_alpha[: MID_Y0 + 1].any(), "midground content above MID_Y0+1"
 assert not fg_alpha[: FG_Y0 + 1].any(), "foreground content above FG_Y0+1"
 
 mid_idx, pf2_pal = layer_indices(mid_img)
-fg_idx, pf1_pal = layer_indices(fg_img)
+far_idx, far_pal = layer_indices(far_img, 4)
+fg_idx, pf1_pal = layer_indices(fg_img, 11)
+
+# PF1 pens: 1..11 foreground, 12..15 far layer.
+far_pal = pad_pal(far_pal, 4)
+pf1_pal = pad_pal(pf1_pal, 11) + far_pal
+assert len(pf1_pal) == 15
+far_idx[far_idx > 0] += 11
 
 # ---------------------------------------------------------------- sky
 sky = np.asarray(L["sky"])[..., :3].astype(float)
@@ -240,21 +267,25 @@ for s in range(SUN_SPRITES):
         sun_words += struct.pack(">HH", a, b)
 
 # ---------------------------------------------------------------- strips
+far_strip = mirror_strip(far_idx, FAR_Y0)
 mid_strip = mirror_strip(mid_idx, MID_Y0)
 fg_strip = mirror_strip(fg_idx, FG_Y0)
+far_bytes = pack_planes(far_strip)
 mid_bytes = pack_planes(mid_strip)
 fg_bytes = pack_planes(fg_strip)
+assert len(far_bytes) == 4 * FAR_H * STRIP_BYTES
 assert len(mid_bytes) == 4 * MID_H * STRIP_BYTES
 assert len(fg_bytes) == 4 * FG_H * STRIP_BYTES
 
 HDR = 16
-OFF_MID = HDR
+OFF_FAR = HDR
+OFF_MID = OFF_FAR + len(far_bytes)
 OFF_FG = OFF_MID + len(mid_bytes)
 OFF_SUN = OFF_FG + len(fg_bytes)
 data = bytearray(b"PLX2")
-data += struct.pack(">HHHH", 2, MID_H, FG_H, SUN_D)
+data += struct.pack(">HHHHH", 3, FAR_H, MID_H, FG_H, SUN_D)
 data += bytes(HDR - len(data))
-data += mid_bytes + fg_bytes + sun_words
+data += far_bytes + mid_bytes + fg_bytes + sun_words
 while len(data) % 4:
     data += b"\0"
 
@@ -296,7 +327,7 @@ os.makedirs(OUTDIR, exist_ok=True)
 with open(os.path.join(OUTDIR, "parallax.dat"), "wb") as f:
     f.write(data)
 with open(os.path.join(OUTDIR, "layers.bin"), "wb") as f:
-    f.write(mid_bytes + fg_bytes)
+    f.write(far_bytes + mid_bytes + fg_bytes)
 with open(os.path.join(OUTDIR, "sprites.bin"), "wb") as f:
     f.write(spr_block)
 with open(os.path.join(OUTDIR, "text.bin"), "wb") as f:
@@ -321,11 +352,14 @@ def carray(name, cols):
 os.makedirs(HDRDIR, exist_ok=True)
 consts = [("SCENE_W", W), ("SCENE_H", H), ("TITLE_H", TITLE_H),
           ("PERIOD_WORDS", PERIOD_WORDS), ("STRIP_BYTES", STRIP_BYTES),
+          ("FAR_Y0", FAR_Y0), ("FAR_H", FAR_H),
           ("MID_Y0", MID_Y0), ("MID_H", MID_H),
           ("FG_Y0", FG_Y0), ("FG_H", FG_H),
           ("SUN_H", SUN_D), ("SUN_X", SUN_X), ("SUN_Y", SUN_Y),
           ("SUN_SPRITES", SUN_SPRITES),
+          ("FAR_SPEED", FAR_SPEED),
           ("MID_SPEED", MID_SPEED), ("FG_SPEED", FG_SPEED),
+          ("OFF_FAR", OFF_FAR),
           ("OFF_MID", OFF_MID), ("OFF_FG", OFF_FG), ("OFF_SUN", OFF_SUN),
           ("ASSET_SIZE", len(data)), ("TEXT_PEN", text_pen)]
 with open(os.path.join(HDRDIR, "assets.h"), "w") as f:
@@ -345,7 +379,7 @@ with open(os.path.join(HDRDIR, "assets.i"), "w") as f:
 os.makedirs(PREVDIR, exist_ok=True)
 
 
-def render(mid_px, fg_px):
+def render(far_px, mid_px, fg_px):
     img = np.zeros((TITLE_H + H, W, 3), np.uint8)
     for y in range(H):
         img[TITLE_H + y] = np.array(sky4[y]) * 17
@@ -354,12 +388,13 @@ def render(mid_px, fg_px):
             v = sun_idx[y, x]
             if v:
                 img[TITLE_H + SUN_Y + y, SUN_X + 1 + x] = np.array(sun_pal[v - 1]) * 17
-    for strip, y0, pal, off in [(mid_strip, MID_Y0, pf2_pal, mid_px),
-                                (fg_strip, FG_Y0, pf1_pal, fg_px)]:
-        P = np.array([(0, 0, 0)] + list(pal)) * 17
+    for strip, y0, pal, off in [(far_strip, FAR_Y0, pf1, far_px),
+                                (mid_strip, MID_Y0, pf2, mid_px),
+                                (fg_strip, FG_Y0, pf1, fg_px)]:
+        P = np.array(pal) * 17
         cols = (np.arange(W) + off) % strip.shape[1]
         win = strip[:, cols]
-        rows = img[TITLE_H + y0:TITLE_H + H]
+        rows = img[TITLE_H + y0:TITLE_H + y0 + win.shape[0]]
         m = win > 0
         rows[m] = P[win[m]]
     # title text (the visible window starts 16 bitmap pixels in)
@@ -371,8 +406,8 @@ def render(mid_px, fg_px):
     return Image.fromarray(img, "RGB")
 
 
-render(0, 0).save(os.path.join(PREVDIR, "preview_0.png"))
-render(160, 320).save(os.path.join(PREVDIR, "preview_1.png"))
+render(0, 0, 0).save(os.path.join(PREVDIR, "preview_0.png"))
+render(64, 160, 320).save(os.path.join(PREVDIR, "preview_1.png"))
 
 print("parallax.dat: %d bytes" % len(data))
 print("PF1 colours: %d  PF2 colours: %d  sun colours: %d  text pen: %d"
