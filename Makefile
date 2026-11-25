@@ -84,5 +84,8 @@ $(HDF): build/parallax
 clean:
 	rm -rf build src/assets.i src/assets.h src/*.o src/parallax
 
+run: adf
+	amiberry -G --model A1200 -0 build/parallax-demo.adf 
+
 distclean: clean
 	rm -rf assets
