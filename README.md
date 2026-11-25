@@ -1,8 +1,9 @@
 # Parallax Scrolling Demo — Amiga 1200 (AGA), pure 68k assembly
 
 A parallax scrolling demo for AGA Amigas running **locked at 50 fps**:
-hardware-scrolled dual playfield, a copper sky, a sprite sun and the blitter
-streaming new columns into the scrolling buffers. It uses the war-torn
+hardware-scrolled dual playfield, a copper sky, a sprite sun, the blitter
+streaming new columns into the scrolling buffers and a copper-driven
+per-scanline perspective road. It uses the war-torn
 background art from
 `craftpix-771800-free-war-pixel-art-2d-game-backgrounds.zip`
 (the **War1 / Bright** layer set: sky, sun, ruins, houses, road, fence, craters).
@@ -25,12 +26,16 @@ custom chips directly.
   4 colours, scrolling at **0.25 px/frame** (12.5 px/s).
 * **Midground** (house3 + houses2) — playfield 2, 4 bitplanes,
   15 colours, scrolling at **0.5 px/frame** (25 px/s).
-* **Foreground** (houses1 + fence + road + craters) — playfield 1, 4
+* **Foreground** (houses1 + fence + top of the road) — playfield 1, 4
   bitplanes, 11 colours, scrolling at **1 px/frame** (50 px/s).
+* **Road** (road + craters, the bottom 28 lines from `ROAD_Y0` = 172) —
+  playfield 1, same 11 colours, **every scanline at its own speed**: from
+  1 px/frame at the top (matching the foreground) to 2 px/frame at the
+  bottom, a perspective floor.
 * Scroll steps are AGA **quarter pixels**, and the loop is locked to the
   vertical blank: every frame moves exactly the same distance.
 
-The three layers are real, independently moving parallax layers. The far
+The far, mid and foreground layers are real, independently moving parallax layers. The far
 layer shares PF1 with the foreground, but the two never occupy the same
 scanlines: above `FG_Y0` PF1 shows the far layer and PF2 (midground) has
 priority over it (`BPLCON2` bit 6); at `FG_Y0` PF1 switches to the foreground
@@ -95,13 +100,16 @@ The PNG layers were extracted from the supplied zip into `assets/`.
    3-colour sprites, with the sprite control words already baked in.
 4. **Mirror-tiles** each layer (`[scene][mirror(scene)]`, period 640 px =
    40 words); row 0 of each strip is left empty on purpose (see below).
-5. Renders the two title lines into a 4-plane bitmap using the built-in 8×8
+5. Cuts the road band (rows 172–199) out of the foreground and stretches
+   row *r* horizontally to `ROAD_PW[r]` words (40 at the top, 80 at the
+   bottom), each followed by 21 words of overlap (see *Perspective road*).
+6. Renders the two title lines into a 4-plane bitmap using the built-in 8×8
    font.
-6. Writes the files that the assembly source `incbin`s:
+7. Writes the files that the assembly source `incbin`s:
 
    | file | contents |
    |---|---|
-   | `build/layers.bin` | far + PF2 + PF1 planar strips (119,680 B) |
+   | `build/layers.bin` | far + PF2 + PF1 planar strips + road rows (128,864 B) |
    | `build/sprites.bin` | 3 sun sprites + null sprite, control words included |
    | `build/text.bin` | 4-plane title bitmap (5,040 B) |
    | `build/sky.bin` | 200 colour words (one per scene line) |
@@ -177,22 +185,37 @@ A1200 ROM.
   ~43 min for the far layer) the position is reduced modulo one strip period
   and the 21-column window is rebuilt. The jump preserves the visual phase,
   so it is invisible.
+* **Perspective road.** From `ROAD_Y0` down the foreground art is only
+  road (fully opaque; houses1/fence never show there, and the midground and
+  far layer are hidden), so the copper switches PF1 a second time, to a
+  static road bitmap. Giving each line its own speed would shear the
+  craters into streaks within seconds, so row *r* is stored pre-stretched to
+  `ROAD_PW[r]` words and moves `ROAD_PW[r]/40` times as fast: with one
+  texture position `m`, row *r* sits at `m·ROAD_PW[r]/40`, so the whole band
+  moves as one piece and the craters just widen towards the viewer. Each
+  row is its period followed by its first 21 words again, so any start word
+  can be fetched as is. Per line the copper writes only `BPLCON1` (fine
+  scroll, 0–63 quarter pixels) and `BPL1MOD` = 2·(`ROAD_PW[r]` + w[r+1] −
+  w[r]), which steps the PF1 pointers from this row's start word to the next
+  row's. No blitter, no rebase: the position wraps at one period. The sky
+  `COLOR00` writes are dropped on these lines, since the sky is hidden.
 * **Copper.** The copper list sets the AGA registers, both palettes, the
   sprite pointers, one `COLOR00` per scanline, and the playfield pointer
   patches. Above `FG_Y0` PF1 shows the far layer and PF2 shows the empty row
   until `MID_Y0`; at each layer's first line the copper switches the modulo
   to 0 and the pointers to the scrolling buffer, and at `FG_Y0` it switches
   PF1 to the foreground, changes `BPLCON1` and clears `PF2PRI`. Two copper
-  lists are double-buffered: the CPU patches the idle one (26 words) and
-  swaps `COP1LC` once per frame.
+  lists are double-buffered: the CPU patches the idle one (26 words plus 64
+  for the road) and swaps `COP1LC` once per frame.
 * **Fixed transparent rows.** The previous C version pointed the “empty”
   part of each playfield at `base + w·2 − 42`, which walks into real image
   data after a while; the assembly version uses a fixed empty row (the
   64-byte guard before each buffer), so the title band and the sky above each
   layer stay clean forever.
-* **Memory.** One `AllocMem(MEMF_CHIP|MEMF_CLEAR)` block of 244,728 bytes:
-  strips (119,680), far buffer (4×9,456), PF2 buffer (4×11,512), PF1 buffer
-  (4×7,352), title (5,040), sprites (584) and two 3,072-byte copper lists.
+* **Memory.** One `AllocMem(MEMF_CHIP|MEMF_CLEAR)` block of 249,208 bytes:
+  strips (110,720), road rows (18,144), far buffer (4×9,456), PF2 buffer
+  (4×11,512), PF1 buffer (4×6,176), title (5,040), sprites (584) and two
+  3,072-byte copper lists.
 * **OS friendliness.** The OS keeps running: `LoadView(NULL)` detaches the
   system view while the demo owns `COP1LC`; the blitter is owned only around
   the column blits; `LoadView(oldview)` restores the display and
@@ -203,12 +226,13 @@ A1200 ROM.
 The main loop waits for the 50 Hz vertical blank with `WaitTOF()`. Per frame
 it only:
 
-1. advances the three quarter-pixel positions,
-2. computes the two `BPLCON1` words,
-3. patches 26 copper words,
+1. advances the three quarter-pixel positions and the road position,
+2. computes the two `BPLCON1` words and the 28 road rows' start word and
+   delay (one `mulu` + one `divu` per row),
+3. patches 26 + 64 copper words,
 4. swaps `COP1LC`.
 
-That is a few hundred cycles; the only real work is four tiny blits every
+That is a few thousand cycles at most; the only real work is four tiny blits every
 16, 32 or 64 frames (one word per row). The far layer adds no bitplane DMA —
 its scanlines were already being fetched for the empty PF1 row — so the
 demo stays VBL-locked at 50 fps with a large margin, and the CPU spends
@@ -222,6 +246,8 @@ almost all of its time in `WaitTOF()`.
 * PF1's 15 colours are split between the foreground (11) and the far layer
   (4); PF2 keeps 15 colours for the midground. The original art has thousands
   of colours.
+* The road is stretched up to 2× horizontally at the bottom, so it is
+  slightly blockier than the original art there.
 * The far layer is only displayed above `FG_Y0`, where PF1 is not used by the
   foreground; it is hidden behind the midground/foreground below that line.
 * Requires AGA (the demo checks for Lisa and exits on OCS/ECS).

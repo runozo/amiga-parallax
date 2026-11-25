@@ -3,7 +3,8 @@
  *
  * Historical C implementation.  The demo is now written in 68k assembly
  * (src/parallax.s); this file is kept for reference only and is no longer
- * part of the build.
+ * part of the build (it predates the far layer and the perspective road,
+ * and no longer matches the generated assets.h).
  *
  *   sky        per-line COLOR00 gradient written by the copper
  *   sun        three hardware sprites, behind both playfields

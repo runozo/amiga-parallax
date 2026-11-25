@@ -10,10 +10,22 @@ Layers (scaled to a 320x200 scene):
   * far       -> PF1, 4 bitplanes, 4 colours   (ruins, above FG_Y0)
   * midground -> PF2, 4 bitplanes, 15 colours  (house3 + houses2)
   * foreground-> PF1, 4 bitplanes, 11 colours  (houses1 + fence + road + craters)
+  * road band -> PF1 rows ROAD_Y0.., same 11 colours, per-scanline parallax
 
 PF1's 15 colours are partitioned: entries 1..11 belong to the foreground,
 entries 12..15 to the far layer.  The copper switches PF1's bitmap at
 FG_Y0, so no palette reload is needed in the middle of a frame.
+
+Below ROAD_Y0 the foreground composite is the road alone (opaque, nothing
+of houses1/fence shows), so the demo switches PF1 to a separate "road"
+bitmap there and scrolls every scanline at its own speed: a perspective
+floor.  Row r is the mirror-tiled road row stretched horizontally to
+ROAD_PW[r] words (40 at the top .. 80 at the bottom) and scrolled at
+ROAD_PW[r]/40 times the foreground speed, so the texture moves as one piece
+(craters keep their shape, they just get wider towards the viewer) instead
+of being sheared apart.  Each row is followed by its first 21 words again,
+so any start word can be fetched with a plain per-line BPL1MOD: no blitter
+streaming is needed for this band.
 
 Each playfield layer is mirror-tiled to a 640-pixel period (40 words) and
 stored as a planar strip; the demo streams 16-pixel columns out of it with
@@ -21,7 +33,7 @@ the blitter.  Row 0 of every strip is kept empty: the demo relies on it to
 show a transparent playfield above each layer.
 
 Outputs (in <outdir>):
-  layers.bin     far + mid + fg planar strips, ready to be incbin'd
+  layers.bin     far + mid + fg planar strips + road rows, ready to be incbin'd
   sprites.bin    final 3-sprite sun block + null sprite (control words baked)
   text.bin       4-plane title bitmap (rendered from the built-in 8x8 font)
   sky.bin        200 colour words, one per scene line
@@ -49,16 +61,24 @@ PERIOD_WORDS = 40          # mirror tile period: 640 px
 STRIP_BYTES = PERIOD_WORDS * 2
 MID_Y0 = 26                # first scene row of the PF2 strip (empty row)
 FG_Y0 = 125                # first scene row of the PF1 strip (empty row)
+ROAD_Y0 = 172              # first scene row of the per-line road band
 FAR_Y0 = 0                 # far layer starts at the top of the scene
 FAR_H = FG_Y0 - FAR_Y0     # far layer rows (hidden below the foreground)
 MID_H = H - MID_Y0
-FG_H = H - FG_Y0
+FG_H = ROAD_Y0 - FG_Y0     # the foreground strip stops where the road starts
+ROAD_H = H - ROAD_Y0
+ROAD_SCALE_BOT = 2.0       # bottom road row: twice as wide and twice as fast
+ROAD_PW = [int(round(PERIOD_WORDS * (1 + (ROAD_SCALE_BOT - 1) * r / (ROAD_H - 1))))
+           for r in range(ROAD_H)]          # period of each road row, words
+ROAD_ROWB = [(pw + 21) * 2 for pw in ROAD_PW]  # period + one display row
+ROAD_PLANE = sum(ROAD_ROWB)
 SUN_D = 46                 # sun diameter in pixels
 SUN_X, SUN_Y = 56, 4       # sun position in the scene
 SUN_SPRITES = 3            # 3 x 16 px = 48 px wide
 FAR_SPEED = 1              # quarter pixels per frame (0.25 px)
 MID_SPEED = 2              # quarter pixels per frame (0.5 px)
 FG_SPEED = 4               # quarter pixels per frame (1 px)
+ROAD_SPEED = FG_SPEED      # road texture speed (row r moves ROAD_PW[r]/40 x this)
 TEXT_ROWS = TITLE_H + 2
 ROW_BYTES = 21 * 2         # one display row: 21 fetched words
 TEXT_PLANE = TEXT_ROWS * ROW_BYTES
@@ -184,12 +204,34 @@ def pad_pal(pal, n):
     return pal[:n]
 
 
-def mirror_strip(idx, y0):
-    s = idx[y0:]
+def mirror_strip(idx, y0, y1=None):
+    s = idx[y0:y1]
     tile = np.concatenate([s, s[:, ::-1]], axis=1).copy()
     assert tile.shape[1] == PERIOD_WORDS * 16
     tile[0, :] = 0
     return tile
+
+
+def road_rows(idx, y0):
+    """Mirror-tiled road rows, row r stretched to ROAD_PW[r] words, each
+    followed by 21 words of overlap (no empty row)."""
+    s = idx[y0:]
+    tile = np.concatenate([s, s[:, ::-1]], axis=1)
+    rows = []
+    for r, pw in enumerate(ROAD_PW):
+        n = pw * 16
+        row = tile[r, (np.arange(n) * tile.shape[1]) // n]
+        rows.append(np.concatenate([row, row[:21 * 16]]))
+        assert len(rows[-1]) == ROAD_ROWB[r] * 8
+    return rows
+
+
+def pack_rows(rows, depth=4):
+    out = bytearray()
+    for p in range(depth):
+        for row in rows:
+            out += np.packbits(((row >> p) & 1).astype(np.uint8)).tobytes()
+    return bytes(out)
 
 
 def pack_planes(tile, depth=4):
@@ -220,6 +262,7 @@ fg_alpha = np.asarray(fg_img)[..., 3] > 128
 assert far_alpha.any(), "far layer is empty"
 assert not mid_alpha[: MID_Y0 + 1].any(), "midground content above MID_Y0+1"
 assert not fg_alpha[: FG_Y0 + 1].any(), "foreground content above FG_Y0+1"
+assert fg_alpha[ROAD_Y0:].all(), "road band must be fully opaque"
 
 mid_idx, pf2_pal = layer_indices(mid_img)
 far_idx, far_pal = layer_indices(far_img, 4)
@@ -269,23 +312,28 @@ for s in range(SUN_SPRITES):
 # ---------------------------------------------------------------- strips
 far_strip = mirror_strip(far_idx, FAR_Y0)
 mid_strip = mirror_strip(mid_idx, MID_Y0)
-fg_strip = mirror_strip(fg_idx, FG_Y0)
+fg_strip = mirror_strip(fg_idx, FG_Y0, ROAD_Y0)
+road = road_rows(fg_idx, ROAD_Y0)
+assert all((row > 0).all() for row in road)
 far_bytes = pack_planes(far_strip)
 mid_bytes = pack_planes(mid_strip)
 fg_bytes = pack_planes(fg_strip)
+road_bytes = pack_rows(road)
 assert len(far_bytes) == 4 * FAR_H * STRIP_BYTES
 assert len(mid_bytes) == 4 * MID_H * STRIP_BYTES
 assert len(fg_bytes) == 4 * FG_H * STRIP_BYTES
+assert len(road_bytes) == 4 * ROAD_PLANE
 
 HDR = 16
 OFF_FAR = HDR
 OFF_MID = OFF_FAR + len(far_bytes)
 OFF_FG = OFF_MID + len(mid_bytes)
-OFF_SUN = OFF_FG + len(fg_bytes)
+OFF_ROAD = OFF_FG + len(fg_bytes)
+OFF_SUN = OFF_ROAD + len(road_bytes)
 data = bytearray(b"PLX2")
 data += struct.pack(">HHHHH", 3, FAR_H, MID_H, FG_H, SUN_D)
 data += bytes(HDR - len(data))
-data += far_bytes + mid_bytes + fg_bytes + sun_words
+data += far_bytes + mid_bytes + fg_bytes + road_bytes + sun_words
 while len(data) % 4:
     data += b"\0"
 
@@ -327,7 +375,7 @@ os.makedirs(OUTDIR, exist_ok=True)
 with open(os.path.join(OUTDIR, "parallax.dat"), "wb") as f:
     f.write(data)
 with open(os.path.join(OUTDIR, "layers.bin"), "wb") as f:
-    f.write(far_bytes + mid_bytes + fg_bytes)
+    f.write(far_bytes + mid_bytes + fg_bytes + road_bytes)
 with open(os.path.join(OUTDIR, "sprites.bin"), "wb") as f:
     f.write(spr_block)
 with open(os.path.join(OUTDIR, "text.bin"), "wb") as f:
@@ -355,12 +403,15 @@ consts = [("SCENE_W", W), ("SCENE_H", H), ("TITLE_H", TITLE_H),
           ("FAR_Y0", FAR_Y0), ("FAR_H", FAR_H),
           ("MID_Y0", MID_Y0), ("MID_H", MID_H),
           ("FG_Y0", FG_Y0), ("FG_H", FG_H),
+          ("ROAD_Y0", ROAD_Y0), ("ROAD_H", ROAD_H), ("ROAD_PLANE", ROAD_PLANE),
+          ("ROAD_SPEED", ROAD_SPEED),
           ("SUN_H", SUN_D), ("SUN_X", SUN_X), ("SUN_Y", SUN_Y),
           ("SUN_SPRITES", SUN_SPRITES),
           ("FAR_SPEED", FAR_SPEED),
           ("MID_SPEED", MID_SPEED), ("FG_SPEED", FG_SPEED),
           ("OFF_FAR", OFF_FAR),
-          ("OFF_MID", OFF_MID), ("OFF_FG", OFF_FG), ("OFF_SUN", OFF_SUN),
+          ("OFF_MID", OFF_MID), ("OFF_FG", OFF_FG),
+          ("OFF_ROAD", OFF_ROAD), ("OFF_SUN", OFF_SUN),
           ("ASSET_SIZE", len(data)), ("TEXT_PEN", text_pen)]
 with open(os.path.join(HDRDIR, "assets.h"), "w") as f:
     f.write("/* generated by tools/build_assets.py -- do not edit */\n")
@@ -374,6 +425,11 @@ with open(os.path.join(HDRDIR, "assets.i"), "w") as f:
     f.write("; generated by tools/build_assets.py -- do not edit\n")
     for k, v in consts:
         f.write("%-16s equ %d\n" % (k, v))
+    f.write("\n; period of every road row in words (row r moves ROAD_PW/40 x)\n")
+    f.write("        macro   ROAD_PW_TABLE\n")
+    for i in range(0, ROAD_H, 14):
+        f.write("        dc.w    %s\n" % ",".join(str(v) for v in ROAD_PW[i:i + 14]))
+    f.write("        endm\n")
 
 # ---------------------------------------------------------------- preview
 os.makedirs(PREVDIR, exist_ok=True)
@@ -397,6 +453,12 @@ def render(far_px, mid_px, fg_px):
         rows = img[TITLE_H + y0:TITLE_H + y0 + win.shape[0]]
         m = win > 0
         rows[m] = P[win[m]]
+    # road band: every row scrolls at its own speed (ROAD_SPD_* per frame)
+    P = np.array(pf1) * 17
+    for r, pw in enumerate(ROAD_PW):
+        off = (fg_px * pw) // PERIOD_WORDS
+        cols = (np.arange(W) + off) % (pw * 16)
+        img[TITLE_H + ROAD_Y0 + r] = P[road[r][cols]]
     # title text (the visible window starts 16 bitmap pixels in)
     tp = np.array(pf1[text_pen]) * 17
     for y in range(TITLE_H):

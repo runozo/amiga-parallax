@@ -14,9 +14,18 @@
 ;     BPLCON2 priority swap and the per-frame playfield patches.  Two copper
 ;     lists are double buffered.
 ;   * Sun: three hardware sprites behind all playfields.
+;   * Road band (ROAD_Y0..bottom): PF1 switches to a static road bitmap and
+;     every scanline scrolls at its own speed (1 px/frame at the top, 2 at
+;     the bottom: a perspective floor).  Row r is pre-stretched to
+;     ROAD_PW[r] words (40..80) and moves ROAD_PW[r]/40 times as fast, so
+;     the texture stays in one piece.  Each row is followed by 21 words of
+;     overlap, so the copper only needs one BPLCON1 (fine scroll) and one
+;     BPL1MOD (coarse step to the next row's start word) per line; no
+;     blitter work at all.
 ;
-; Per frame the CPU only advances three quarter-pixel positions, patches 26
-; copper words and (every 16/32/64 frames) starts four tiny blits.
+; Per frame the CPU advances three quarter-pixel positions plus 28 road-row
+; positions, patches 26 + 64 copper words and (every 16/32/64 frames)
+; starts four tiny blits.
 ; Everything else runs on the custom chips.
 ;
 ; What was removed with respect to the C version:
@@ -100,6 +109,7 @@ TEXT_SIZE       equ     DEPTH*TEXT_PLANE ; four text bitplanes
 STRIP_FAR_SIZE  equ     DEPTH*FAR_H*STRIP_BYTES ; far strip image size
 STRIP_MID_SIZE  equ     DEPTH*MID_H*STRIP_BYTES ; mid strip image size
 STRIP_FG_SIZE   equ     DEPTH*FG_H*STRIP_BYTES  ; foreground strip image size
+STRIP_ROAD_SIZE equ     DEPTH*ROAD_PLANE        ; road rows image size
 FAR_MEM         equ     GUARD+(FAR_H+1)*ROWB+EXTRA ; far buffer incl. extra row
 FAR_SIZE        equ     (FAR_MEM+7)&~7  ; far plane stride, longword aligned
 MID_MEM         equ     GUARD+(MID_H+1)*ROWB+EXTRA ; mid buffer incl. extra row
@@ -112,7 +122,8 @@ COP_LIST        equ     3072            ; bytes per copper list (1536 words)
 CHIP_SFAR       equ     0               ; far strip image in chip RAM
 CHIP_SMID       equ     CHIP_SFAR+STRIP_FAR_SIZE ; mid strip image
 CHIP_SFG        equ     CHIP_SMID+STRIP_MID_SIZE ; fg strip image
-CHIP_FAR        equ     CHIP_SFG+STRIP_FG_SIZE   ; four far plane buffers
+CHIP_ROAD       equ     CHIP_SFG+STRIP_FG_SIZE   ; road rows (displayed in place)
+CHIP_FAR        equ     CHIP_ROAD+STRIP_ROAD_SIZE ; four far plane buffers
 CHIP_MID        equ     CHIP_FAR+4*FAR_SIZE      ; four mid plane buffers
 CHIP_FG         equ     CHIP_MID+4*MID_SIZE      ; four fg plane buffers
 CHIP_TEXT       equ     CHIP_FG+4*FG_SIZE        ; four text bitplanes
@@ -230,6 +241,13 @@ start:                                  ; program entry point
         move.l  #STRIP_FG_SIZE/4-1,d0   ; longword count minus one
         bsr     copy_longs              ; copy it
 
+        lea     asset_layers+STRIP_FAR_SIZE+STRIP_MID_SIZE+STRIP_FG_SIZE,a0 ; road
+        move.l  d7,a1                   ; destination: chip RAM
+        add.l   #CHIP_ROAD,a1           ; at the road offset
+        move.l  a1,road_base            ; the copper points PF1 straight at it
+        move.l  #STRIP_ROAD_SIZE/4-1,d0 ; longword count minus one
+        bsr     copy_longs              ; copy it
+
         lea     asset_sprites,a0        ; source: sprite images
         move.l  d7,a1                   ; destination: chip RAM
         add.l   #CHIP_SPR,a1            ; at the sprite offset
@@ -309,6 +327,7 @@ start:                                  ; program entry point
         bsr     layer_frame             ; stream its first columns
         move.l  d0,wf                   ; wf = first fetched word
         move.w  d1,df                   ; df = fg scroll delay
+        bsr     road_frame              ; first road row positions
 
         move.w  dfar,d0                 ; above FG_Y0: PF1 = far
         move.w  dm,d1                   ;                PF2 = mid
@@ -374,6 +393,7 @@ main_loop:                              ; one iteration per frame
         bsr     layer_frame             ; advance and refill foreground
         move.l  d0,wf                   ; wf = first fetched word
         move.w  d1,df                   ; df = fg scroll delay
+        bsr     road_frame              ; advance the 28 road rows
 
         move.w  dfar,d0                 ; above FG_Y0: PF1 = far
         move.w  dm,d1                   ;                PF2 = mid
@@ -550,6 +570,42 @@ fill_column:                            ; stream one 16-pixel column
         rts                             ; column complete
 
 ; ===========================================================================
+; road_frame: advance the road; fills road_w (first fetched word of each
+; row, 0..ROAD_PW[r]) and road_d (BPLCON1 delay in quarter pixels, 0..63).
+; road_master is the texture position (quarter pixels, one 640-px period);
+; row r sits at master * ROAD_PW[r] / 40, i.e. inside its own stretched
+; period, so nothing ever overflows and no rebase is needed.
+; ===========================================================================
+road_frame:                             ; per-scanline road positions
+        move.w  road_master,d0          ; texture position
+        addq.w  #ROAD_SPEED,d0          ; advance it
+        cmp.w   #PERIOD_Q,d0            ; past one period?
+        blo.s   .nowrap                 ; no -> keep it
+        sub.w   #PERIOD_Q,d0            ; same picture, one period back
+.nowrap:                                ; position in range
+        move.w  d0,road_master          ; store it
+        lea     road_pw,a0              ; row periods (words)
+        lea     road_w,a2               ; out: start words
+        lea     road_d,a5               ; out: delays
+        moveq   #ROAD_H-1,d7            ; all road rows
+.row:                                   ; one road row
+        moveq   #0,d0                   ; clear...
+        move.w  road_master,d0          ; ...d0 = texture position
+        mulu.w  (a0)+,d0                ; * this row's period
+        divu.w  #PERIOD_WORDS,d0        ; / 40 -> row position (qpx)
+        and.l   #$FFFF,d0               ; drop the remainder
+        move.l  d0,d1                   ; d1 = position
+        neg.l   d1                      ; delay = -position...
+        and.w   #63,d1                  ; ...mod 64 quarter pixels
+        move.w  d1,(a5)+                ; store the delay
+        add.w   d1,d0                   ; position + delay is word aligned
+        lsr.w   #6,d0                   ; -> first fetched word
+        move.w  d0,(a2)+                ; store it
+        dbra    d7,.row                 ; next row
+        move.w  -2(a2),(a2)             ; sentinel: modulo after the last row
+        rts                             ; positions ready
+
+; ===========================================================================
 ; make_con1: d0.w = PF1 delay, d1.w = PF2 delay -> d2.w = BPLCON1 word
 ;   bits 0-3 PF1 coarse, 4-7 PF2 coarse, 8-9 PF1 fine, 12-13 PF2 fine
 ; ===========================================================================
@@ -667,6 +723,26 @@ build_list:                             ; emit a complete copper list
         or.w    #$DF,d0                 ; horizontal position $DF
         move.w  d0,(a3)+                ; copper WAIT (v,h)
         move.w  #$FFFE,(a3)+            ; ...with mask $FFFE
+
+        cmp.w   #ROAD_Y0,d7             ; inside the road band?
+        blt.s   .sky                    ; no -> normal scene line
+        addq.l  #2,a2                   ; sky is hidden under the road
+        cmp.w   #ROAD_Y0,d7             ; first road line?
+        bne.s   .road_line              ; no -> just BPLCON1 + BPL1MOD
+        lea     patch_road_ptr,a5       ; remember the road pointer block
+        move.l  a3,(a5,a4.w)            ; store the address for this list
+        move.w  #BPL1PTH,d5             ; PF1 pointer registers
+        moveq   #3,d2                   ; four planes
+.roadptr:                               ; road pointer placeholder
+        COPSLOT                         ; zero placeholder, patched per frame
+        dbra    d2,.roadptr             ; loop over the four planes
+        lea     patch_road,a5           ; row 0's BPLCON1 move; row r is at
+        move.l  a3,(a5,a4.w)            ; +12*r (WAIT, BPLCON1, BPL1MOD)
+.road_line:                             ; every road line
+        COPMOVE BPLCON1,0               ; placeholder: this row's delay
+        COPMOVE BPL1MOD,0               ; placeholder: step to the next row
+        bra     .next_line              ; nothing else on road lines
+.sky:                                   ; normal scene line
         move.w  #COLOR00,(a3)+          ; write COLOR00
         move.w  (a2)+,(a3)+             ; next sky colour
 
@@ -711,6 +787,7 @@ build_list:                             ; emit a complete copper list
         COPSLOT                         ; zero placeholder, patched per frame
         dbra    d2,.fgptr               ; loop over the four planes
 .not_fg:                                ; not the foreground start line
+.next_line:                             ; advance to the next scanline
         addq.w  #1,d6                   ; next video line
         addq.w  #1,d7                   ; next scene row
         cmp.w   #SCENE_H,d7             ; whole scene done?
@@ -751,6 +828,33 @@ patch_list:                             ; patch the per-frame copper values
         lea     patch_con1_bot,a0       ; lower BPLCON1 patch-table entry
         move.l  (a0,a4.w),a1            ; -> lower BPLCON1 value word
         move.w  con1_bot,(a1)           ; fg (PF1) + mid (PF2) delays
+
+        lea     patch_road_ptr,a0       ; road pointer-table entry
+        move.l  (a0,a4.w),a1            ; -> road pointer block in this list
+        move.l  road_base,a0            ; road plane 0 (row 0)
+        moveq   #0,d0                   ; clear...
+        move.w  road_w,d0               ; ...d0 = row 0 start word
+        move.l  #ROAD_PLANE,d1          ; road plane stride
+        bsr     patch_ptr               ; patch the four road pointers
+
+        lea     patch_road,a0           ; road line table entry
+        move.l  (a0,a4.w),a1            ; -> row 0's BPLCON1 move
+        lea     road_w,a0               ; start words (+ sentinel)
+        lea     road_d,a5               ; delays
+        lea     road_pw,a2              ; row periods (words)
+        moveq   #ROAD_H-1,d7            ; all road rows
+.road:                                  ; one road scanline
+        move.w  (a5)+,d0                ; PF1 = this row's delay
+        move.w  dm,d1                   ; PF2 = mid (hidden under the road)
+        bsr     make_con1               ; d2 = BPLCON1 word
+        move.w  d2,2(a1)                ; BPLCON1 value
+        move.w  2(a0),d4                ; next row's start word
+        sub.w   (a0)+,d4                ; - this row's start word
+        add.w   (a2)+,d4                ; + row length - 21 fetched words
+        add.w   d4,d4                   ; words -> bytes
+        move.w  d4,6(a1)                ; BPL1MOD value
+        lea     12(a1),a1               ; next road line
+        dbra    d7,.road                ; repeat for every row
         rts                             ; list patched
 
 ; ===========================================================================
@@ -801,6 +905,14 @@ patch_pf1:      dc.l    0,0             ; PF1 patch address per list
 patch_pf2:      dc.l    0,0             ; PF2 patch address per list
 patch_con1_top: dc.l    0,0             ; upper BPLCON1 address per list
 patch_con1_bot: dc.l    0,0             ; lower BPLCON1 address per list
+patch_road_ptr: dc.l    0,0             ; road pointer block per list
+patch_road:     dc.l    0,0             ; road row 0 BPLCON1 move per list
+road_base:      dc.l    0               ; road plane 0 (row 0)
+road_pw:        ROAD_PW_TABLE           ; per-row period in words
+road_master:    dc.w    0               ; road texture position (qpx)
+road_w:         dcb.w   ROAD_H+1,0      ; per-row first word (+ sentinel)
+road_d:         dcb.w   ROAD_H,0        ; per-row BPLCON1 delay
+        cnop    0,4                     ; keep what follows aligned
 
 cur:            dc.w    0               ; copper list currently displayed
 next:           dc.w    0               ; copper list being patched
@@ -847,7 +959,7 @@ fg_layer:                               ; foreground layer descriptor
 ; ---- generated assets ---------------------------------------------------
 palette:        incbin  "palette.bin"   ; 32 AGA colour words
 sky:            incbin  "sky.bin"       ; one background colour per scene line
-asset_layers:   incbin  "layers.bin"    ; mirrored far/mid/fg planar strips
+asset_layers:   incbin  "layers.bin"    ; far/mid/fg strips + road rows
 asset_sprites:  incbin  "sprites.bin"   ; hardware sprite images
 asset_text:     incbin  "text.bin"      ; title text bitplanes
 
